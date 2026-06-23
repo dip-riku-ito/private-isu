@@ -578,11 +578,11 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	tmplIndex.Execute(w, struct {
-		Posts     []Post
+		PostsHTML template.HTML
 		Me        User
 		CSRFToken string
 		Flash     string
-	}{posts, me, getCSRFToken(r), getFlash(w, r, "notice")})
+	}{renderPosts(posts), me, getCSRFToken(r), getFlash(w, r, "notice")})
 }
 
 func getAccountName(w http.ResponseWriter, r *http.Request) {
@@ -654,13 +654,13 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
 	tmplUser.Execute(w, struct {
-		Posts          []Post
+		PostsHTML      template.HTML
 		User           User
 		PostCount      int
 		CommentCount   int
 		CommentedCount int
 		Me             User
-	}{posts, user, postCount, commentCount, commentedCount, me})
+	}{renderPosts(posts), user, postCount, commentCount, commentedCount, me})
 }
 
 func getPosts(w http.ResponseWriter, r *http.Request) {
@@ -700,7 +700,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tmplPosts.Execute(w, posts)
+	io.WriteString(w, string(renderPosts(posts)))
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
@@ -735,9 +735,9 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 	me := getSessionUser(r)
 
 	tmplPostID.Execute(w, struct {
-		Post Post
-		Me   User
-	}{p, me})
+		PostHTML template.HTML
+		Me       User
+	}{renderPostOne(p), me})
 }
 
 func postIndex(w http.ResponseWriter, r *http.Request) {

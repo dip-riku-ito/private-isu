@@ -34,6 +34,7 @@
 | 16 | POST/ の画像BLOB DB書込み廃止（imgdata空・FS保存のみ） | **258645** | ~243000 | 0 | warm中央値(+5.7%・+14k)。DBダイジェスト#1=INSERT posts BLOB 16s/avg31msを排除。mysqld 47.5→35.9%(-11.6pt)・POST/ 32.59→9.33ms(-71%)・DB肥大停止(1.8G不変)。画像配信回帰なし(GET/image 200/実体)。壁は再びapp(Go)~49% |
 | 17 | users をプロセス内キャッシュ（id→User、ban/initで無効化） | **268322** | ~252000 | 0 | warm中央値(+3.7%・+9.7k)。usersクエリ34260→1704回(-95%・digest実測)・mysqld35.9→30.8%(-5pt)。ban回帰なし(timeline SQLがdel_flg=0でDB権威＋cache delete二重防御)。app(Go)49%横ばい(scanAll減を高スループットが相殺)。次DB大口はcomments(本体10.4s+件数7.7s) |
 | 18 | makePostsの冗長COUNTクエリ排除（本体取得結果からGo側カウント・byte等価） | **270092** | ~252000 | 0 | warm中央値(+0.66%・+1.8k)。COUNT GROUP BY 16324回/7.7s→**0(消滅)**・mysqld30.8→26.75%(-4pt)。本体クエリがLIMIT無し全件返すため件数は同値(Verifier PASS)。mysqldはもう主壁でない(Step5 130%→26.8%)。壁はapp(Go)51%のhtml/template30.5% |
+| 19 | 投稿描画を html/template→手書きGoレンダラ化（reflection全廃・byte等価をtestで証明） | **283179** | ~264000 | 0 | warm中央値(+4.8%・+13k)。**template Execute 30.5→5.5%(-25pt)・reflect.Value.Call 14.9→~0**・getIndex31.8→16.0%・app(Go)51.1→46.5%。バイト等価をrender_test.goで機械証明＋実機fail0(レギュレーション担保)。次の壁はsession復号~12% |
 
 ---
 
@@ -708,3 +709,39 @@ Step17後の digest で comments が DB首位群（本体10.4s＋COUNT 7.7s）�
 - DB #1残は comments本体取得(11.75s)＝表示3件のために全件取得する無駄。SQL側LIMITはStep12の窓関数同様mysqld負荷増で却下、**コメントキャッシュ化が筋**（ただしmysqld非律速ゆえ優先度低）。
 - 残る最大レバー: **(A) html/template高速化（app本丸・code-gen要/高リスク） / (B) GOGC調整でGC14.8%削減（安全・低コスト） / (C) bench別ホスト退避（HW・2台目要・ユーザー手配不可）**。
 - セッション通算 **231.5k→270.1k（+16.6%）, fail0維持**。ローカルは2vCPU飽和＋同居bench(37%)税で頭打ち圏。各SWは総work削減なので主催側の多コア/別ホストベンチで開花する。
+
+---
+
+## Step 19: 投稿描画を html/template → 手書きGoレンダラ化（reflection全廃）— score 283,179（+13k）
+
+### 背景
+app(Go)51%の最大コスト＝**html/template.Execute 30.5%（うち reflect.Value.Call 14.9%＝各補間の自動エスケープ関数呼び出し）**。html/template は補間ごとに escaper を reflect 経由で呼ぶため、投稿1件×20の post.html 描画でこれが支配的だった。
+
+### 施策（webapp/golang/）
+- **render.go(新規)**: `renderPostInto/renderPosts/renderPostOne` が posts.html/post.html と**同一バイト列**を手書きで生成（reflection不使用）。escaper `htmlTextReplacer` は Go の htmlReplacementTable と完全一致（NUL,",&,',**+**,<,>）。エスケープ適用は .Body/.Comment/.CreatedAtFmt のみ、他は安全値で raw。
+- app.go: getIndex/getAccountName を `PostsHTML template.HTML`(=renderPosts), getPosts を `io.WriteString(renderPosts())`, getPostsID を `PostHTML`(=renderPostOne) に。templates の include を `{{.PostsHTML}}`/`{{.PostHTML}}` に置換。
+
+### レギュレーション担保（最重要）— バイト等価を test で機械証明
+**render_test.go**: 手書き出力 vs 実 html/template 出力を、敵対的入力(`<>&"'+`・`<script>`・多バイト・空・0/複数コメント)＋**ページ全体(layout+index, 旧include方式 vs 新方式)**で**バイト完全一致**を検証。全PASS。
+- テストが「html/template は `+`→`&#43;` も escape する」見落としを検出→escaperに+追加で一致（推測だけなら見逃した）。
+- **実機でも fail0**（ベンチが GET/ /posts/:id /@user のHTMLを検証＝バイト一致を runtime 確認）。
+
+### ⚠️ 安全性の急所（Verifier指摘・将来も維持必須）
+.User.AccountName を raw 出力できる前提は **validateUser `\A[0-9a-zA-Z_]{3,}\z`（register で強制）＋初期データ英数**＝HTML/URL特殊文字を含まないこと。**この account_name バリデーションを緩めると、バイト等価とXSS安全性が同時に崩れる**。緩和禁止。posts.html/post.html は render_test.go の基準なので削除しないこと。
+
+### Before → After（warm中央値）
+| 指標 | Step 18 | Step 19 |
+|---|---|---|
+| score | 270092 | **283179（+4.8%・+13k）** |
+| fail | 0 | 0 |
+| html/template.Execute | 30.5% | **5.5%（-25pt）** |
+| reflect.Value.Call | 14.9% | **~0（top圏外）** |
+| getIndex cum% | 31.8% | **16.0%（半減）** |
+| app(Go) %CPU | 51.1 | **46.5（-4.6pt）** |
+| mallocgc(GC) | 14.8% | 12.7% |
+
+### 🎯 セッション総括と次のボトルネック
+- **html/template は陥落**（30.5→5.5%）。renderPosts は手書きでわずか3.5%。
+- **app新最大コスト = セッション復号 ~12%**（gorilla-sessions-memcache + securecookie + gob）。※ただし gsm.Get は gorilla registry で per-request デデュープ済(=1リク1復号)なので「session.Get集約」では減らない（検証済）。減らすには session機構/直列化の置換（中〜高リスク）が要る。
+- 次点: postIndex の画像upload multipart(~15.6%・syscall重・inherent)、DB scan(12.3%)、GC(12.7%)。
+- **このセッション通算: Step13 231,540 → Step19 283,179（+22.3%）, 全Step fail0**。ローカルは依然2vCPU飽和＋同居bench(39%)税で頭打ち圏だが、Step14-19は全て「総work削減」なので**主催側の多コア/bench分離ベンチで本領を発揮する**。
