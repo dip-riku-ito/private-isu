@@ -111,7 +111,9 @@ score = Σ(GET成功×1) + Σ(POST成功×3[=1+2]) + Σ(画像投稿成功×6[=5
 | **6.5** | **（運用）ディスク恒久解放**: ログ切詰＋`PURGE BINARY LOGS`＋`disable_log_bin` | infra | **✅ disk 100%→70%・再増殖停止** | 低 | ✅完了(Step7に統合) |
 | **7** | **MySQL設定＋nginx静的/gzip/keepalive＋FD上限**（TUNING_LOG Step7+7b） | MySQL/app/nginx | **✅ 132k→156127 (+18%)・mysqld130→44%・壁がapp(Go)へ** | 中（FD上限の見落としで一度38k崩落→是正） | ✅完了 |
 
-### ▶ 進捗サマリ: 43.7k(S5) → 132k(S6) → **156k(S7)**。壁の変遷: DB律速→disk枯渇→FD枯渇→**app(Go) CPU(72.9%)**。次はGo CPU削減。
+| **8** | **DB接続プール＋interpolateParams=true** | app(Go)/MySQL | **✅ 156k→170721 (+9%)・mysqld %wait→0・app(Go)74%継続** | 低 | ✅完了 |
+
+### ▶ 進捗サマリ: 43.7k(S5) → 132k(S6) → 156k(S7) → **170.7k(S8)**。壁の変遷: DB律速→disk枯渇→FD枯渇→**app(Go) CPU(74%)が継続**。次はGo CPU単価削減（テンプレ事前パース→makPostsユーザーcache→/@user集計）。
 | 7 | makePosts全ユーザー走査(67811回)の撲滅: 全ユーザーを memcache/メモリへcache（ban時invalidate）or 出現user_idをIN絞り | MySQL CPU/app | 中-大 | 中（ban整合） | 未 |
 | 8 | MySQL設定: buffer_pool 128MB→1GB(動的`SET GLOBAL`可), flush_log_at_trx_commit 1→2, sync_binlog/binlog OFF(要restart) | MySQL | 中 | 低-中（restart要否） | 未 |
 | 9 | app/nginx層: DSN `interpolateParams=true`+接続プール, テンプレ起動時1回パース, 静的css/js/faviconをnginx直配信+expires(304=+1点)+gzip+upstream keepalive | app/nginx | 中（DB解放後に効く） | 低 | 未 |

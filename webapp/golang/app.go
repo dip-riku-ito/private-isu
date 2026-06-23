@@ -918,12 +918,17 @@ func main() {
 	}
 	cfg.ParseTime = true
 	cfg.Loc = time.Local
+	cfg.InterpolateParams = true // prepare+exec の2往復を排除（クライアント側でパラメータ展開）
 	dsn := cfg.FormatDSN()
 
 	db, err = sqlx.Open("mysql", dsn)
 	if err != nil {
 		log.Fatalf("Failed to connect to DB: %s.", err.Error())
 	}
+	// 接続プール: 既定の MaxIdleConns=2 による接続の張り直し(再ハンドシェイク)を排除。
+	db.SetMaxOpenConns(100)
+	db.SetMaxIdleConns(100)
+	db.SetConnMaxLifetime(0)
 	defer db.Close()
 
 	r := chi.NewRouter()

@@ -24,6 +24,7 @@
 | 5 | 投稿系クエリJOIN+LIMIT20 / getPostsID imgdata除外 / comments(user_id)索引 | **43763** | 42258 | 0 | warm中央値(+40.8%)。全1万行fetch→20行が主効果 |
 | 6 | タイムラインクエリ FORCE INDEX+STRAIGHT_JOIN（filesort排除） | **~132000** | ~127000 | 0 | warm clean2回値(約3倍)。GET/ 354→43.6ms(8x)。run3はディスク満杯でfail(infra) |
 | 7 | disk恒久解放(binlog off)＋MySQL(buffer1G/flush2)＋nginx静的/gzip/keepalive＋FD上限 | **156127** | ~151000 | 0 | warm中央値(+18%)。mysqld130→44%、壁がapp(Go)へ移行 |
+| 8 | DB接続プール(MaxOpen/Idle100)＋interpolateParams=true | **170721** | ~165000 | 0 | warm中央値(+9%)。mysqld %wait 2.6→0。app(Go)依然74%で壁 |
 
 ---
 
@@ -365,3 +366,38 @@ warm(破棄)160079 / run1 156127 / run2 159352 / run3 154390（全fail0）→ **
 1. **Step8(次): DB接続プール（SetMaxOpenConns/Idle）＋ DSN `interpolateParams=true`** — MaxIdleConns既定2による接続churnと、全クエリprepare+exec2往復を解消。%wait13.6＋driver CPU削減。小変更・高確度[大]。
 2. Step9: テンプレートの起動時1回パース（毎リク `template.Must(ParseFiles)` → CPU/file I/O削減。高頻度HTML経路）。
 3. makePostsの全ユーザー走査(毎リクSELECT users)キャッシュ/IN絞り、/@userの重い集計(76ms)軽量化、pprofでホットパス特定。
+
+---
+
+## Step 8: DB接続プール + interpolateParams — score 170,721 (warm中央値)
+
+### 背景
+Step7で壁が app(Go) CPU(72.9%) へ移行。Goのリクエスト処理コスト削減フェーズの初手として、低リスク・高確度な接続層の最適化（Verifier監査#2）を実施。
+
+### 施策（webapp/golang/app.go db初期化）
+- `cfg.InterpolateParams = true`: 全クエリの **prepare+exec 2往復 → クライアント側補間で1往復**に。MySQLプロトコル待ち・driver CPU削減。
+- `SetMaxOpenConns(100)/SetMaxIdleConns(100)/SetConnMaxLifetime(0)`: 既定 MaxIdleConns=2 による**接続張り直し(再ハンドシェイク)を排除**。
+
+### Before → After（warm中央値・新プロトコル warmup+本2回）
+| 指標 | Step 7 | Step 8 |
+|---|---|---|
+| score | 156127 | **170721 (+9%)** |
+| success | ~151000 | ~165000 |
+| fail | 0 | 0 |
+| GET / avg | 45.5ms | 41.0ms |
+| GET /posts avg | 49.9ms | 42.1ms |
+| GET /@user avg | 76.4ms | 62.3ms |
+
+### CPU（pidstat %CPU, 2vCPU=200%）
+- app(Go) 74.1%（変化小・**依然ボトルネック**, usr64.5）
+- mysqld 43.6%・**%wait 2.6→0.0**（prepare往復消失でMySQLプロトコル待ち解消）
+
+### 検証（Verifier PASS）
+interpolateParams はバイナリ`[]byte`(imgdata)含め安全（driver v1.10.0 が `_binary'...'` 補間・結果集合完全同一、utf8mb4は安全charset、複文/LOAD DATA無し）。プール値妥当(max_conn151>100)。`go build`/`go vet` OK。
+留保: ConnMaxLifetime=0 は本番常駐なら wait_timeout 未満推奨（ベンチでは実害なし）。複数appインスタンス時は MaxOpen×台数≤max_conn に再調整。
+
+### 考察
+接続往復/churn削減で +9%・各avg 10〜18%短縮。だが tier は変わらず **app(Go) CPU(74%, usr64.5＝ユーザー空間支配)**。次の本丸は**テンプレレンダリング/makePosts処理そのもの**のCPU削減。
+
+### 次（Step9）
+**テンプレートの起動時1回パース**（現状ハンドラ毎に `template.Must(ParseFiles)`＝毎リクfile I/O+パース。高頻度HTML経路 GET//posts/@user のusr CPU直撃）。
