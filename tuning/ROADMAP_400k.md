@@ -118,10 +118,11 @@ score = Σ(GET成功×1) + Σ(POST成功×3[=1+2]) + Σ(画像投稿成功×6[=5
 
 | **10-11** | **pprof診断→makePostsの全1000ユーザー走査を必要idのIN取得へ** | app(Go) | **✅ 173.7k→204283 (+17.6%, 20万超)・app(Go)70.7→50.3%・scanAll52→17%・壁がtemplate Executeへ** | 低(出力等価PASS) | ✅完了 |
 | **12** | (不採用) コメントROW_NUMBER 3件限定 | - | ❌ -1.7%(204→200.8k)。app→mysqld へ荷移動で純減→revert。学び:50/50拮抗時は片側削っても無意味 | - | 🔁revert |
-| **13** | **/posts?max_created_at の nginxキャッシュ**（Reg試算 単独+48k） | nginx | **✅キャッシュ安全性 Reg確認済**(画像数≥20のみ検証/2016固定で投稿集合不変)。両層から仕事を消す | 低(nginx設定のみ) | ⏳実行中 |
-| 14+ | template Execute(48%)削減 / /posts/:id キャッシュ(要invalidation) / GET/計算量削減 | app | 根本層・次の本命 | 中 | 未 |
+| **13** | **/posts?max_created_at の nginxキャッシュ** | nginx | **✅ 204→231540 (+13.3%)。GET/posts 0.00ms・app/mysqld両-3pt。CPU~25%遊休=GET/レイテンシ律速へ** | 低 | ✅完了 |
+| 14+ | **GET / の template Execute(48%)高速化** / GET/匿名キャッシュ / 690k=増コア検討 | app/HW | 根本層・次の本命(GET/レイテンシ直撃) | 中 | ⏳次 |
 
-### ▶ 進捗サマリ: 43.7k(S5)→132k(S6)→156k(S7)→170.7k(S8)→173.7k(S9)→**204.3k(S11)**。S12は不採用(revert)。壁: **template Execute(48%) と mysqld(50%) が拮抗**。次はキャッシュで両層から仕事を消す(S13)。
+### ▶ 進捗サマリ: …→204.3k(S11)→**231.5k(S13)**。壁の現状: **CPU約25%遊休＝もはやCPU律速でなく GET /(13ms,最多)のレイテンシ律速**。GET/を速くすれば遊休CPUで伸びる。GET/コスト=template Execute(48%)。
+### ▶ 690k目標(>従来天井~390k): Reg再分析中。鍵は「GET/をnear-free化できるか(匿名キャッシュ/template code-gen)」と「増コア要否」。現状CPU遊休ありなのでまだSWで伸びる余地大。
 ### ▶ キャッシュ安全性(Reg/benchmarker実装): /posts?max_created_at=✅無期限可(画像≥20のみ検証) / /posts/:id=✅可(画像≥1のみ・要invalidationで厳密) / GET /=❌(ban即時+CSRF) / /@user=⚠️HTTP不可(CSRF混線)・DB結果memcacheは可。**コメント件数/本文はbench未検証**。
 
 ### ▶ 400k可否（Reg定量判定 / S9時点で校正）

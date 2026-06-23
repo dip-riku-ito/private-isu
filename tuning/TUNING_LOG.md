@@ -27,6 +27,8 @@
 | 8 | DB接続プール(MaxOpen/Idle100)＋interpolateParams=true | **170721** | ~165000 | 0 | warm中央値(+9%)。mysqld %wait 2.6→0。app(Go)依然74%で壁 |
 | 9 | テンプレート起動時1回パース | **173720** | ~168000 | 0 | warm中央値(+1.7%)。app(Go)74→70.7%。パースは主因でなく効果限定 |
 | 10-11 | pprof診断→makePostsの全ユーザー走査(1000行)を必要user_idのIN取得へ | **204283** | ~195000 | 0 | warm中央値(+17.6%)。app(Go)70.7→50.3%、scanAll52→17%。壁がtemplate Execute(48%)へ |
+| 12 | (不採用)コメントROW_NUMBER 3件限定 | 200860 | - | 0 | -1.7%。app→mysqld荷移動で純減→revert |
+| 13 | /posts?max_created_at= の nginxキャッシュ(proxy_cache) | **231540** | ~221000 | 0 | warm中央値(+13.3%)。GET/posts 41→0.00ms(HIT~100%)。app/mysqld両-3pt・CPU~25%遊休=GET/レイテンシ律速へ |
 
 ---
 
@@ -499,3 +501,35 @@ makePosts の !allComments 経路で、全コメントfetch→Go破棄を `ROW_N
 - **app と mysqld が 50/50 拮抗のときは、片側の負荷を減らしてもう片側に積む施策は逆効果**。スコアを上げるには「総量を減らす」か「より忙しい側を減らす」必要がある。
 - html/template.Execute は 47.9%→48.4% で不変＝コメントscan削減では app 最大コスト(テンプレ描画)に届かない。
 - → 正解は **両層から仕事を消すキャッシュ**（Step13: /posts nginx cache）。Step11(204283) を採用ベースに戻した。
+
+---
+
+## Step 13: /posts?max_created_at= の nginx proxy_cache — score 231,540 (warm中央値)
+
+### 背景
+Reg が benchmarker 実装でキャッシュ安全性を確認: /posts は `画像数≥20` のみ検証、max_created_at=**2016固定**でベンチ新規投稿(2026)は結果に入らない＝**返す投稿集合は初期データで不変**（正当に不変・gamingでない）。Step12の学び「両層から仕事を消す」に合致。
+
+### 施策（tuning/STEP13_posts_cache.sh / nginx）
+`proxy_cache_path /var/cache/nginx/posts ...` ＋ server に `location = /posts { proxy_cache posts_cache; proxy_cache_valid 200 24h; }`。X-Cacheヘッダで MISS→HIT 確認。アプリ・DB不変。
+
+### Before → After（warm中央値）
+| 指標 | Step 11 | Step 13 |
+|---|---|---|
+| score | 204283 | **231540 (+13.3%, +27k)** |
+| fail | 0 | 0 |
+| GET /posts avg | ~41ms | **0.00ms (HIT~100%)** |
+| app(Go) %CPU | 50.3 | 46.6 |
+| mysqld %CPU | 50.5 | 47.5 |
+
+### 実効確認
+X-Cache HIT率~100%（probe全HIT）。GET /posts は n=7040 で avg 0.00ms＝nginxが即返し app/DB を一切叩かない。fail/stale なし。
+
+### 🎯 次のボトルネック: GET / レイテンシ（CPU遊休下の latency 律速）
+- system合計 ~175%/200 ＝ **CPU約25%遊休**。app/mysqld とも ~47% で**未飽和**。
+- ＝もはやCPU律速でなく、**11ワーカーが GET /（13.16ms・最多 n=15458）の応答待ち**で律速。GET/レイテンシを削れば遊休CPUを使ってスコアが伸びる。
+- GET / の13ms = makePosts(効率化済) + **template Execute（pprof 48%, reflect.Value.Call 24%）**が主。GET/はlogin/CSRF/ban依存で素直なHTTPキャッシュ不可。
+
+### 次（Step14候補）
+- **GET / の template Execute 高速化**（code-gen テンプレ/reflection削減）＝GET/レイテンシ直撃。
+- or GET / の匿名版キャッシュ+ログイン時動的注入（690k戦略としてReg精査中）。
+- ※690k目標: Reg再分析中（現HWのSW天井 vs 増コア必要性）。
