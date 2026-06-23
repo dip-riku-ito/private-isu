@@ -763,3 +763,42 @@ app(Go)51%の最大コスト＝**html/template.Execute 30.5%（うち reflect.Va
 `location = /posts` に Step15 の `/` と同じ Cookie バイパスを追加（`if ($http_cookie ~* "isuconp-go\.session") { set $bypass 1; }` ＋ `proxy_cache_bypass/proxy_no_cache $bypass`、`proxy_ignore_headers` から Set-Cookie を外す）。匿名 /posts のみキャッシュになる。
 - スコア影響は小さい見込み（/posts は indexMoreAndMore 等の匿名アクセスが主＝匿名分はHIT維持、Cookie有のみ MISS→Go）。適用時は1温間計測で実測すること。
 - 判断: 安全/公式ベンチ耐性優先なら適用。ローカルスコア最優先かつ「ベンチがCSRF跨ぎを突かない」前提なら現状維持も可。**2026-06-23 セッション終了時点で未適用**。
+
+---
+
+## 🖥️ ローカル再現環境（EC2消失後の代替・2026-06-23）
+
+EC2 インスタンスが消失したため、以降のチューニング検証を **Mac / Docker Desktop** 上で行えるようにした。設定一式は `tuning/local/`（ブランチ `isucon-tuning-local`、commit `a2a7b6b`）。詳細は `tuning/local/README.md`。
+
+### 固定スペック（EC2 c6i.large 模擬）
+競技スタック(nginx/app/mysql/memcached) を **合計 2 vCPU / 3.5GB** に固定:
+- CPU: 全サービス `cpuset: "0,1"` → 2コアを共有（カーネルが自由にスケジュール＝EC2の2vCPU共有を模擬）
+- MEM: mysql 1.6G / app 1.0G / nginx 0.5G / memcached 0.4G = 計3.5G
+- ベンチ: **macOSホスト側で実行**（Docker VM外・別コア）。EC2のベンチ同居（37〜39%税）と違い競技側2コアはクリーン
+- ホストHW: Apple Silicon 10コア/16GB、Docker Desktop VM(linux/arm64, 10CPU/8GB)
+
+### 計測（warm1+本計測3回の中央値・fail0）
+| 構成 | スコア中央値 | runs | fail |
+|---|---|---|---|
+| baseline（チューニング前 = master） | **9,450** | 9450 / 9502 / 9375 | 0 |
+| tuned（Step19 = isucon-tuning） | **636,713** | 603058 / 657569 / 636713 | 0 |
+
+→ 同一固定スペック上で **約 67倍**。施策の効果はローカルでも明確に再現する。
+
+### ⚠️ 絶対値は EC2 と一致しない（重要）
+- tuned のローカル絶対値(636k) > EC2実機(283k)。理由: ①ベンチを別コア(ホスト)で走らせ競技側2コアを食わない（EC2は同居でベンチが37〜39%消費）②Apple Silicon が速い。
+- **EC2の数値(各Stepのscore)とは比較しないこと。ローカルは「同一マシン上での施策の相対比較」専用**。各Stepの再計測をローカルで行う場合も、EC2系列の表とは別系列として扱う。
+
+### 構築時のハマりどころと対処（再現時の注意）
+1. **社内TLS傍受**: コンテナ内 `go mod download` が `x509: certificate signed by unknown authority` で失敗 → **ホストで `server` をクロスコンパイル**(`GOOS=linux GOARCH=arm64 CGO_ENABLED=0`)し実行イメージにバイナリのみ搭載（`dockerfile_inline`）。`run.sh` が自動化。
+2. **baseline(master) は openssl バイナリ依存**: パスワードハッシュが `openssl dgst -sha512` にシェルアウト（Step2でGo内製化する前）→ baselineイメージにのみ openssl 同梱。tuned(branch)は純Goで不要。
+3. **MySQL healthcheck 誤検知**: 公式entrypointは初期化中にソケット限定の一時サーバを立てるため `ping -h localhost`(ソケット)が早期healthyに → **`-h 127.0.0.1`(TCP)強制**で本サーバ起動後のみhealthy。
+4. **MySQL は `ADD INDEX IF NOT EXISTS` 非対応** → 通常 `ALTER ... ADD INDEX` + `mysql --force`（Duplicate key name無視）で冪等化。
+5. **tuned は画像をFS配信**: 初期画像(DB BLOB)を `cmd/dumpimages` で `webapp/public/image/` に書き出し（1万枚）。`run.sh tuned` が索引適用とあわせ自動実行。
+
+### 使い方
+```sh
+tuning/local/run.sh baseline   # or tuned （port80/3306を使うため切替時は down してから）
+tuning/local/bench.sh          # warmup1 + 本計測3回
+```
+baseline用に master を `../private-isu-baseline`（git worktree）へ展開している（不要なら `git worktree remove`）。
