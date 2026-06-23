@@ -283,26 +283,10 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		postIDs[i] = posts[i].ID
 	}
 
-	// コメント件数を一括取得
+	// コメント本体を一括取得（post_idごとに created_at 降順）。!allComments なら各投稿の最新3件のみ採用。
+	// Step18: コメント件数(CommentCount)はこの全件取得から Go 側で数える。本体クエリが既に各投稿の
+	// 全コメントを返すため、別途の `COUNT(*) GROUP BY` クエリ(digest 7.7s/16k回)は冗長＝排除（結果同一）。
 	countMap := make(map[int]int, len(posts))
-	{
-		q, args, err := sqlx.In("SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN (?) GROUP BY `post_id`", postIDs)
-		if err != nil {
-			return nil, err
-		}
-		var counts []struct {
-			PostID int `db:"post_id"`
-			Count  int `db:"count"`
-		}
-		if err := db.SelectContext(ctx, &counts, db.Rebind(q), args...); err != nil {
-			return nil, err
-		}
-		for _, c := range counts {
-			countMap[c.PostID] = c.Count
-		}
-	}
-
-	// コメント本体を一括取得（post_idごとに created_at 降順）。!allComments なら各投稿の最新3件のみ採用
 	commentMap := make(map[int][]Comment, len(posts))
 	{
 		q, args, err := sqlx.In("SELECT * FROM `comments` WHERE `post_id` IN (?) ORDER BY `post_id`, `created_at` DESC, `id` DESC", postIDs)
@@ -314,6 +298,7 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 			return nil, err
 		}
 		for _, c := range comments {
+			countMap[c.PostID]++ // 全コメントを数える（表示用に3件残すかは下で判定）
 			if !allComments && len(commentMap[c.PostID]) >= 3 {
 				continue
 			}

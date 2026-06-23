@@ -33,6 +33,7 @@
 | 15 | 匿名(未ログイン)GET/ の nginxキャッシュ(proxy_cache・Cookie有はbypass) | **244635** | ~232000 | 0 | warm中央値(+6.4%・+14.8k)。GET/ 12.55→5.03ms(-60%)・匿名41%が0ms HIT。残59%は認証workerでBYPASS→Goへ(ban/CSRF安全)。Reg試算+105kに届かぬのは①cache対象が匿名41%のみ②CPU飽和で解放分が再吸収。fail0 |
 | 16 | POST/ の画像BLOB DB書込み廃止（imgdata空・FS保存のみ） | **258645** | ~243000 | 0 | warm中央値(+5.7%・+14k)。DBダイジェスト#1=INSERT posts BLOB 16s/avg31msを排除。mysqld 47.5→35.9%(-11.6pt)・POST/ 32.59→9.33ms(-71%)・DB肥大停止(1.8G不変)。画像配信回帰なし(GET/image 200/実体)。壁は再びapp(Go)~49% |
 | 17 | users をプロセス内キャッシュ（id→User、ban/initで無効化） | **268322** | ~252000 | 0 | warm中央値(+3.7%・+9.7k)。usersクエリ34260→1704回(-95%・digest実測)・mysqld35.9→30.8%(-5pt)。ban回帰なし(timeline SQLがdel_flg=0でDB権威＋cache delete二重防御)。app(Go)49%横ばい(scanAll減を高スループットが相殺)。次DB大口はcomments(本体10.4s+件数7.7s) |
+| 18 | makePostsの冗長COUNTクエリ排除（本体取得結果からGo側カウント・byte等価） | **270092** | ~252000 | 0 | warm中央値(+0.66%・+1.8k)。COUNT GROUP BY 16324回/7.7s→**0(消滅)**・mysqld30.8→26.75%(-4pt)。本体クエリがLIMIT無し全件返すため件数は同値(Verifier PASS)。mysqldはもう主壁でない(Step5 130%→26.8%)。壁はapp(Go)51%のhtml/template30.5% |
 
 ---
 
@@ -679,3 +680,31 @@ ban整合は二重防御で安全: ①timeline/profileのSQLが `JOIN users WHER
 - DB次点: **comments（本体10.4s＋COUNT 7.7s＝18s）**（cache or comment_count非正規化。benchは件数未検証）。
 - セッション復号~9%は registry デデュープ済で潰せない。
 - 飽和下でローカルは逓減だが、各SWは総work削減＝**主催側の多コア機で開花**。セッション通算 231.5k→268.3k（**+15.9%**, fail0維持）。
+
+---
+
+## Step 18: makePosts の冗長 COUNT クエリ排除 — score 270,092（+1.8k）
+
+### 背景
+Step17後の digest で comments が DB首位群（本体10.4s＋COUNT 7.7s）。makePosts は「コメント本体一括取得」(`SELECT * ... WHERE post_id IN(?)` ・**LIMIT無し＝全件返す**)とは別に `COUNT(*) GROUP BY` を投げており、**本体取得で既に全コメントを得ているのに件数を別クエリで取り直す冗長**があった。
+
+### 施策（webapp/golang/app.go makePosts）
+別建ての COUNT クエリを削除し、本体取得ループ内で `countMap[c.PostID]++`（表示3件に絞る continue の前）で件数を算出。CommentCount は COUNT(*) と byte 等価。
+
+### 検証（Verifier PASS）
+本体クエリが対象postの全コメントをLIMIT無しで返す→Go全行カウント＝COUNT(*)。0件投稿はmap zero値0で一致。allComments/!allComments 双方で全件カウント。**注意(将来の回帰防止): 本体クエリにSQL側LIMIT/ROW_NUMBERを入れるとCommentCountが壊れる→その時はCOUNT復活が必要**（Step12の窓関数を入れない理由の一つ）。
+
+### Before → After（warm中央値）
+| 指標 | Step 17 | Step 18 |
+|---|---|---|
+| score | 268322 | **270092（+0.66%・+1.8k）** |
+| fail | 0 | 0 |
+| COUNT GROUP BY 呼出/run | 16324回/7.7s | **0（消滅）** |
+| mysqld %CPU | 30.8 | **26.75（-4pt）** |
+| app(Go) %CPU | 49.3 | 51.1（Goカウント＋高スループットで微増） |
+
+### 🎯 到達点と残ボトルネック（mysqldはもう壁でない）
+- 累積で mysqld は Step5 ~130% → **26.8%**。DB側は概ね削り切り、**主ボトルネックは app(Go) 51%＝html/template 30.5%**。
+- DB #1残は comments本体取得(11.75s)＝表示3件のために全件取得する無駄。SQL側LIMITはStep12の窓関数同様mysqld負荷増で却下、**コメントキャッシュ化が筋**（ただしmysqld非律速ゆえ優先度低）。
+- 残る最大レバー: **(A) html/template高速化（app本丸・code-gen要/高リスク） / (B) GOGC調整でGC14.8%削減（安全・低コスト） / (C) bench別ホスト退避（HW・2台目要・ユーザー手配不可）**。
+- セッション通算 **231.5k→270.1k（+16.6%）, fail0維持**。ローカルは2vCPU飽和＋同居bench(37%)税で頭打ち圏。各SWは総work削減なので主催側の多コア/別ホストベンチで開花する。
