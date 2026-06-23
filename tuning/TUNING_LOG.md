@@ -802,3 +802,27 @@ tuning/local/run.sh baseline   # or tuned （port80/3306を使うため切替時
 tuning/local/bench.sh          # warmup1 + 本計測3回
 ```
 baseline用に master を `../private-isu-baseline`（git worktree）へ展開している（不要なら `git worktree remove`）。
+
+---
+
+## 🔬 ローカル自律改善サイクル（Agent Teams・2026-06-24 セッション）
+
+EC2消失後のローカル固定スペック環境で、Ideationチーム(App/Go・DB・nginx/infra)起案→優先度付け→実装→計測の自律サイクルを実施。詳細は `tuning/local/SESSION_ROADMAP.md`。
+
+### 結果（4サイクル）
+| Cycle | 施策 | 判定 |
+|---|---|---|
+| C1 | GOGC=200+GOMEMLIMIT | 中立(app非CPU律速) |
+| C2 | nginxキャッシュ拡大(/posts CSRF是正+/posts/:id microcache) | **回帰-18%→revert**。CSRF跨ぎ漏洩バグが速度の不正な下駄だったと判明(安全版は-18%) |
+| C3 | db-1 comment_count非正規化+コメントLIMIT3(LATERAL) | 中立→revert(DB非律速。LATERALのper-postオーバヘッドが局所では効かず) |
+| C4 | **nginx gzip off** | **採用 +6.8%**(interleaved A/B) |
+
+### 最重要の教訓（計測方法論）
+- **マシンが session 中に ~13% 下方ドリフト**(615k→537k。長時間ベンチの蓄熱でブースト持続クロック低下。pmset CPU_Speed_Limit=100でも低い)。**このドリフトが施策効果(数%)より大きく、固定baselineとの比較を無効化する**。
+- 対策: **interleaved A/B**(設定をreloadで1runずつ交互に切替え、BASE/TREATをペアで測りドリフトを相殺)。nginx設定はreload~1sなので有効。C4はこれで+6.8%を確定。
+- 局所律速: not CPU(プール63%) / not DB(mysql23%) / **nginxが最ホット(~54%)**。効いたのはnginx CPU削減(gzip off)のみ。app/DB系micro-optは局所中立(多コアEC2では別途プロファイル根拠で評価)。
+- gzip off適用時は **nginx proxy_cache の旧gzipエントリをパージ必須**(`rm /var/cache/nginx/*`)。
+- ⚠️ gzip off は localhost配信特有の結果の可能性。**EC2(実ネットワーク)では転送量が効くため再評価必須**。
+
+### 計測ツール（tuning/local/）
+`measure.sh`(per-run冷却+pmsetサーマル監視) / `measure_ab.sh`(interleaved A/B) / `profile.sh`(pprof採取) / `run.sh`(環境起動) / `nginx-variants/`(A/B用設定)。

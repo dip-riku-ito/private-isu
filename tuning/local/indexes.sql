@@ -6,3 +6,4 @@ ALTER TABLE comments ADD INDEX idx_post_created (post_id, created_at);
 ALTER TABLE posts    ADD INDEX idx_user_id (user_id);
 ALTER TABLE posts    ADD INDEX idx_created_at (created_at);
 ALTER TABLE comments ADD INDEX idx_user_id (user_id);
+-- 注: C3(db-1, comment_count非正規化)は中立だったため不採用・revert済(SESSION_ROADMAP参照)。

@@ -45,6 +45,10 @@ services:
       ISUCONP_DB_PASSWORD: root
       ISUCONP_DB_NAME: isuconp
       ISUCONP_MEMCACHED_ADDRESS: memcached:11211
+      GOGC: "200"           # Cycle1(appgo-2): GC頻度を約半減(局所は中立だが無害・多コアでSTW減見込み)
+      GOMEMLIMIT: "768MiB"  # OOM安全網(app mem_limit=1000MBの内側)。超過時は強制GC
+      # pprof外部公開は app.go の PPROF_ADDR 対応(今回revert)とセット。再開時は app.go 改修+下記env/portを復活:
+      #   PPROF_ADDR: ":6060"  と ports: - "6060:6060"
     volumes:
       # app は ../public(=/home/public) に画像を書き出す。nginx の /public と同じホストディレクトリを共有。
       - /Users/riku-ito/Workspaces/sandbox/private-isu/webapp/public:/home/public
