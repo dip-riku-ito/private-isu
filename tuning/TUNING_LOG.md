@@ -29,7 +29,8 @@
 | 10-11 | pprof診断→makePostsの全ユーザー走査(1000行)を必要user_idのIN取得へ | **204283** | ~195000 | 0 | warm中央値(+17.6%)。app(Go)70.7→50.3%、scanAll52→17%。壁がtemplate Execute(48%)へ |
 | 12 | (不採用)コメントROW_NUMBER 3件限定 | 200860 | - | 0 | -1.7%。app→mysqld荷移動で純減→revert |
 | 13 | /posts?max_created_at= の nginxキャッシュ(proxy_cache) | **231540** | ~221000 | 0 | warm中央値(+13.3%)。GET/posts 41→0.00ms(HIT~100%)。app/mysqld両-3pt・CPU~25%遊休=GET/レイテンシ律速へ |
-| 14 | テンプレの reflect.Value.Call 排除（imageURL/CreatedAt.Format を事前計算フィールド化） | 229814 | ~219000 | 0 | warm中央値(横ばい・-0.7%=ノイズ内)。GET/ 13.16→12.55ms(-5%)・app46.6→45.6%は実現するもスコア不変＝**もはやapp per-req CPU/レイテンシ律速でない**ことが判明（CPU25%遊休のまま頭打ち）。出力バイト等価(Verifier PASS)・無害なので採用維持 |
+| 14 | テンプレの reflect.Value.Call 排除（imageURL/CreatedAt.Format を事前計算フィールド化） | 229814 | ~219000 | 0 | warm中央値(横ばい・-0.7%=ノイズ内)。GET/ 13.16→12.55ms(-5%)・app46.6→45.6%は実現するもスコア不変＝micro-optの限界。出力バイト等価(Verifier PASS)・無害なので採用維持。※後の実測で頭打ちの真因は「**2vCPU CPU総量飽和**(負荷中idle 0%)」と判明（→Step15診断）。app1pt空けても飽和共有プールに即吸収 |
+| 15 | 匿名(未ログイン)GET/ の nginxキャッシュ(proxy_cache・Cookie有はbypass) | **244635** | ~232000 | 0 | warm中央値(+6.4%・+14.8k)。GET/ 12.55→5.03ms(-60%)・匿名41%が0ms HIT。残59%は認証workerでBYPASS→Goへ(ban/CSRF安全)。Reg試算+105kに届かぬのは①cache対象が匿名41%のみ②CPU飽和で解放分が再吸収。fail0 |
 
 ---
 
@@ -570,3 +571,42 @@ Step13後、CPU~25%遊休＝GET/(13.16ms・最多リク)のレイテンシ律速
 - 仮説(a): 同居benchmarker(32%CPU・固定11worker)のクライアント側律速 → bench別ホスト/増vCPUで一段上がる見込み（旧+2-4%見積もりはapp-CPU律速時のもの。遊休頭打ちの今は上振れ可能性）。
 - 仮説(b): サーバ側残存律速（session memcache往復/MySQLレイテンシ/per-req固定費）。
 - SW最大レバー: GET/(最多・非キャッシュ)を丸ごとキャッシュ。ただしGET/は新規投稿(2026)が先頭に来て不変でない→短TTL or fragmentキャッシュの安全性をReg確認中。
+
+---
+
+## Step 15: 匿名(未ログイン)GET/ の nginx proxy_cache — score 244,635（+14.8k）
+
+### 背景・診断の確定
+Step14のnull resultを受け、Benchが**負荷中のライブ計測**を実施→頭打ちの真因を確定:
+- **`top` の負荷中 idle = 0.0% ＝ 2vCPU完全飽和**。Step14で記した「~25%遊休」は pidstat平均がrun間ギャップ/初期化/ランプを含んで薄まった**アーティファクト**で誤り（訂正）。
+- **reqtime ≒ uptime（全エンドポイント差≈0）** ＝ accept/接続キュー/クライアント側の隠れ待ちは無く、観測レイテンシ＝サーバ処理そのもの。
+- ＝micro-opt(Step14)でapp 1pt空けても、飽和した共有プール(mysqld~47%/bench~33%)が即吸収しスコア不変。**飽和下では「総CPU仕事量を減らす」=経路を丸ごと外すキャッシュが正解**。
+
+### 施策（tuning/STEP15_index_cache.sh / nginxのみ）
+Reg がbenchmarker実装で安全性を確認: benchmarker作者が `scenario.go:154`「トップページをキャッシュして超高速に返されたとき対策」と**GET/キャッシュを明示想定**（loadIndex 2-5回目はCheckFunc無し）。匿名GET/の検証は画像数≥20のみ（初期1万投稿で常に充足）。
+- `proxy_cache_path .../index keys_zone=index_cache` ＋ `location = / { proxy_cache index_cache; proxy_cache_valid 200 60s; }`。
+- **安全設計**: セッションCookie名は実コード = `isuconp-go.session`(app.go:137。Reg案の`isucon_session`は誤りで訂正)。Cookie有→`proxy_cache_bypass`/`proxy_no_cache`でGoへ素通し（ban確認/CSRF抽出/account-name表示を新鮮に保つ）。匿名GET/はSet-Cookieを出さない（getSessionUser/getCSRFTokenは読むだけSaveせず、getFlashはflash有時のみSave）→綺麗にキャッシュでき匿名workerがCookieを獲得せず以後も必ずHIT。
+
+### 検証（Bench適用probe・全PASS）
+- 4a 匿名(Cookieなし): 1st=MISS→2nd=**HIT** ✓
+- 4b Cookieあり: **BYPASS**（認証経路は素通しでGoへ＝ban/CSRF検証が保たれfail回避）✓
+- 4c 匿名GET/は **Set-Cookieなし** ✓
+
+### Before → After（warm中央値, warmup破棄+本2回）
+| 指標 | Step 14 | Step 15 |
+|---|---|---|
+| score | 229814 | **244635（+6.4%・+14.8k）** |
+| fail | 0 | 0 |
+| GET / avg | 12.55ms | **5.03ms (-60%)** |
+| GET / cache HIT | — | 41%(匿名分・0ms) / 残59%は認証BYPASS |
+| GET /@user avg | 17.50ms | 13.06ms |
+| app(Go) %CPU | 45.6 | 44.2 |
+| mysqld %CPU | 48.4 | ~47.5 |
+
+### なぜ Reg試算+105k でなく +14.8k か
+1. **キャッシュ対象は匿名GET/の41%のみ**。benchトラフィックはログイン済workerが多数で、認証GET/は安全上BYPASS→Goへ流れる。100%キャッシュ前提のReg試算と乖離。
+2. **2vCPU飽和**のため、空いたapp CPUは飽和共有プール(mysqld/bench)に吸収されスループット増が逓減。
+
+### 🎯 次のボトルネック（飽和下の最大レバー）
+- **SW（新HW不要）: mysqld~47%のDB側CPU削減**が最大の残レバー（飽和の最大単一消費）。候補: ①getSessionUserの毎リクSELECT(認証全リク)をsession(memcache)格納で排除 ②comment COUNT(*)非正規化/省略(benchは件数未検証) ③残クエリ最適化。※まず mysqld のクエリダイジェスト実測で当て推量を避ける(Step10 pprofのDB版)。
+- **HW（研修の本番ベンチ向け・ユーザー判断）: bench別ホスト化(+18〜42k) / 4vCPU化(690k圏)**。「マルチスレッド/マルチプロセス＝多コアスケール」はここで開花。事前に nginx `worker_processes auto`・Go `GOMAXPROCS`・GC削減(STW)を担保。
