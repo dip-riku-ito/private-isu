@@ -482,3 +482,20 @@ app.go に `_ "net/http/pprof"` import ＋ main で `go http.ListenAndServe("loc
 - **★ /posts?max_created_at の nginxキャッシュ**（Reg試算 単独+48k・規定上安全か要確認＝コメント変化の影響）。
 - template Execute削減（reflect.Call圧縮）、comment_count非正規化（COUNT排除）、/@user軽量化。
 - ※400k可否(Reg): 同居2vCPU天井~390k、ベンチ別ホスト化は+4%（任意）。10倍差の主因はSW最適化の深さ＝到達可能。
+
+---
+
+## Step 12（不採用・revert）: コメント本体を ROW_NUMBER で各投稿最新3件に SQL 限定
+
+### 試した施策
+makePosts の !allComments 経路で、全コメントfetch→Go破棄を `ROW_NUMBER() OVER (PARTITION BY post_id ORDER BY created_at DESC, id DESC) <= 3` で SQL側3件限定に。Verifier は出力等価 PASS。
+
+### 結果: **微減 204283 → 200860（-1.7%, fail0）→ revert**
+- 再pprof: 狙い通り app側 scanAll 17%→7.9%（コメント無駄scan半減）。だが…
+- **mysqld 50.5%→54.5% に上昇**（窓関数の PARTITION/sort コスト）。app 50.3→47.6%。
+- ＝コストを app(余裕あり) から **mysqld(co-bottleneck) に移しただけで純減**。
+
+### 学び（重要）
+- **app と mysqld が 50/50 拮抗のときは、片側の負荷を減らしてもう片側に積む施策は逆効果**。スコアを上げるには「総量を減らす」か「より忙しい側を減らす」必要がある。
+- html/template.Execute は 47.9%→48.4% で不変＝コメントscan削減では app 最大コスト(テンプレ描画)に届かない。
+- → 正解は **両層から仕事を消すキャッシュ**（Step13: /posts nginx cache）。Step11(204283) を採用ベースに戻した。
