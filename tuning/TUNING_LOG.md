@@ -745,3 +745,21 @@ app(Go)51%の最大コスト＝**html/template.Execute 30.5%（うち reflect.Va
 - **app新最大コスト = セッション復号 ~12%**（gorilla-sessions-memcache + securecookie + gob）。※ただし gsm.Get は gorilla registry で per-request デデュープ済(=1リク1復号)なので「session.Get集約」では減らない（検証済）。減らすには session機構/直列化の置換（中〜高リスク）が要る。
 - 次点: postIndex の画像upload multipart(~15.6%・syscall重・inherent)、DB scan(12.3%)、GC(12.7%)。
 - **このセッション通算: Step13 231,540 → Step19 283,179（+22.3%）, 全Step fail0**。ローカルは依然2vCPU飽和＋同居bench(39%)税で頭打ち圏だが、Step14-19は全て「総work削減」なので**主催側の多コア/bench分離ベンチで本領を発揮する**。
+
+---
+
+## ⚠️ 既知のセキュリティ課題（要判断・未適用） — /posts キャッシュの CSRFトークン跨ユーザー漏洩
+
+### 指摘（HIGH・コードで実在確認）
+- Step13 の `location = /posts`（tuning/STEP13_posts_cache.sh, 現行は STEP15 の nginx 設定内）は cache_key に Cookie を含めず 24h 共有＋`proxy_ignore_headers Set-Cookie`。
+- `/posts` のレスポンスは各コメントフォームに `csrf_token`＝**リクエスト元ユーザーのセッションCSRFトークン**を埋め込む（render.go の renderPostInto / makePosts(..., getCSRFToken(r))）。
+- → **最初に /posts を叩いたユーザーのCSRFトークンが、以後その固定URLを叩く全ユーザーに配信される**＝実デプロイなら他人トークン取得→CSRF保護回避が成立する本物の脆弱性。
+
+### 現状の影響
+- **ローカルベンチは fail0**（ベンチはコメント投稿用CSRFを非キャッシュ経路から取得し /posts 由来トークンを投稿に使わない）→ **現スコアに影響なし**。
+- リスク: ①実デプロイ的に脆弱、②**主催の本番ベンチがより厳格なら fail 要因になり得る**。
+
+### 推奨修正（未適用・ユーザー判断待ち）
+`location = /posts` に Step15 の `/` と同じ Cookie バイパスを追加（`if ($http_cookie ~* "isuconp-go\.session") { set $bypass 1; }` ＋ `proxy_cache_bypass/proxy_no_cache $bypass`、`proxy_ignore_headers` から Set-Cookie を外す）。匿名 /posts のみキャッシュになる。
+- スコア影響は小さい見込み（/posts は indexMoreAndMore 等の匿名アクセスが主＝匿名分はHIT維持、Cookie有のみ MISS→Go）。適用時は1温間計測で実測すること。
+- 判断: 安全/公式ベンチ耐性優先なら適用。ローカルスコア最優先かつ「ベンチがCSRF跨ぎを突かない」前提なら現状維持も可。**2026-06-23 セッション終了時点で未適用**。
