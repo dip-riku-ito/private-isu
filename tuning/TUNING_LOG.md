@@ -23,6 +23,7 @@
 | 4 | makePosts N+1解消 + initialize画像cleanup | 31085 | 29847 | 0 | warm中央値。disk逼迫を解消後の安定値(+4.4%) |
 | 5 | 投稿系クエリJOIN+LIMIT20 / getPostsID imgdata除外 / comments(user_id)索引 | **43763** | 42258 | 0 | warm中央値(+40.8%)。全1万行fetch→20行が主効果 |
 | 6 | タイムラインクエリ FORCE INDEX+STRAIGHT_JOIN（filesort排除） | **~132000** | ~127000 | 0 | warm clean2回値(約3倍)。GET/ 354→43.6ms(8x)。run3はディスク満杯でfail(infra) |
+| 7 | disk恒久解放(binlog off)＋MySQL(buffer1G/flush2)＋nginx静的/gzip/keepalive＋FD上限 | **156127** | ~151000 | 0 | warm中央値(+18%)。mysqld130→44%、壁がapp(Go)へ移行 |
 
 ---
 
@@ -316,3 +317,51 @@ mysqld CPUを食い潰していた filesort/全行スキャンを断ち、read a
 3. Step8: MySQL設定（buffer_pool 128MB→1GB / binlog OFF / flush_log_at_trx_commit=2）
 4. Step9: app/nginx（interpolateParams+接続プール / テンプレ起動時1回パース / 静的css·js·faviconをnginx直配信+expires(304=+1点)+gzip+upstream keepalive）
 5. ⚠️ ベンチ同一2vCPUホスト相乗りの頭打ち（真の400kはベンチ別ホスト化が事実上前提）
+
+---
+
+## Step 7: disk恒久解放 + MySQL設定 + nginx静的/gzip/keepalive + FD上限 — score 156,127 (warm中央値)
+
+### 背景
+Step6でmysqld CPU飽和を解消した直後、ベンチ走行で**ディスク100%枯渇**（binlog肥大）し計測不能に。これを恒久解決しつつ、Verifierのコード監査で挙がっていたapp/nginx層の構造的ムダ（静的Go経由・gzip/keepalive無し）をまとめて是正（ユーザーが runbook を `!` 実行）。
+- ⚠️ /initialize の画像cleanup(Step4)はFS投稿画像(id>10000)のみ対象。**binlog・nginxログ・posts.imgdata BLOB は対象外**で、これがディスク逼迫の真因（InnoDBはDELETE済み領域もOSへ返さない）。
+
+### 施策（インフラ。tuning/STEP7_apply.sh, STEP7b_nginx_fd.sh, my.cnf, nginx-isucon.conf）
+1. **disk恒久解放**: nginxログ切詰(116MB)＋`PURGE BINARY LOGS`＋`disable_log_bin`（binlog無効化で再増殖停止）→ **100%→70%**。
+2. **MySQL**: innodb_buffer_pool_size 128MB→1GB / innodb_flush_log_at_trx_commit 1→2（書込みレイテンシ短縮、redo fsyncを毎秒1回に）。
+3. **nginx**: 静的css/js/faviconをnginx直配信（root=public, expires 1d, access_log off）＝**Go負荷オフロード＋304加点**。gzip（text系）。**upstream keepalive 64＋HTTP/1.1**（Goへの接続再利用）。
+4. **⚠️落とし穴→Step7bで修正**: 静的直配信＋高スループットで nginx が `Too many open files`(FD soft=1024) に達しaccept不可→全方位timeoutで **38kに崩落**。`worker_rlimit_nofile 65535` / `worker_connections 8192` / systemd `LimitNOFILE=65535`（daemon-reload+nginx restart）で是正。
+
+### Before → After（warm中央値）
+| 指標 | Before (Step 6) | After (Step 7+7b) |
+|---|---|---|
+| score | ~132000 | **156127（+18%）** |
+| success | ~127000 | ~151000 |
+| fail | 0 | 0 |
+
+### 計測（FD修正後）
+warm(破棄)160079 / run1 156127 / run2 159352 / run3 154390（全fail0）→ **中央値156127**。`Too many open files` 再発0。disk 71%安定（binlog off効果で増えず）。
+
+### 適用確認
+- MySQL: `@@innodb_buffer_pool_size=1GB / @@log_bin=OFF / @@innodb_flush_log_at_trx_commit=2` 確認。
+- 静的nginx直配信: favicon.ico・css とも `Server: nginx` + `Expires` + `Cache-Control: max-age=86400`（Go非経由）。LTSV静的行 ~1万→92行に激減。
+- 索引健在（EXPLAIN filesort無し rows=199）。
+
+### 🎯 ボトルネックの移行（pidstat %CPU, 2vCPU=200%）
+- **app(Go): 72.9%（usr61.9/sys11.1/%wait13.6）← 新ボトルネック（最大消費）**
+- mysqld: 44.4%（Step5の129.7%→**約1/3**。索引＋buffer pool効果）
+- nginx: 13.1%（%wait~30=upstream待ち） / memcached 0.76% / bench同居 13.2%
+- GET /@user 76.4ms が単発最遅。
+→ 律速は **mysqld → app(Go) CPU** へ移行。
+
+### 考察・教訓
+- インフラ一括（disk/MySQL/nginx）。+18%は静的Goオフロード＋keepalive＋MySQL書込み改善の複合（バンドルのため内訳は厳密分離せず）。
+- **教訓: 高速化でスループットが上がると、隠れていた上限が次々顕在化する。Step6→7で「DB律速→disk枯渇→FD枯渇→app律速」と壁が4段移動した。** 各段で実測（CPU占有/エラーログ/df）が無ければ誤診していた。
+
+### 計測プロトコル更新
+- ユーザー要望により次回計測から **ウォームアップ1回＋本計測2回の中央値**（従来3回から短縮）。
+
+### 次の最適化候補（app(Go) CPU削減が本命）
+1. **Step8(次): DB接続プール（SetMaxOpenConns/Idle）＋ DSN `interpolateParams=true`** — MaxIdleConns既定2による接続churnと、全クエリprepare+exec2往復を解消。%wait13.6＋driver CPU削減。小変更・高確度[大]。
+2. Step9: テンプレートの起動時1回パース（毎リク `template.Must(ParseFiles)` → CPU/file I/O削減。高頻度HTML経路）。
+3. makePostsの全ユーザー走査(毎リクSELECT users)キャッシュ/IN絞り、/@userの重い集計(76ms)軽量化、pprofでホットパス特定。

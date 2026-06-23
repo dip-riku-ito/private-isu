@@ -108,7 +108,10 @@ score = Σ(GET成功×1) + Σ(POST成功×3[=1+2]) + Σ(画像投稿成功×6[=5
 | Step | 施策 | 対象tier | 期待効果 | リスク | 状態 |
 |---|---|---|---|---|---|
 | **6** | **タイムラインクエリ計画修正**: getIndex/getPosts に `STRAIGHT_JOIN + FORCE INDEX(idx_created_at)` で 1〜2万行filesort → ~21行索引早期終了 | MySQL CPU | **大（実績: 43.7k→~132k 約3倍, GET/ 354→43.6ms 8x, EXPLAIN filesort消失, fail0）** | 低（planヒントのみ・意味論不変） | ✅完了 |
-| **6.5** | **（運用）ディスク是正**: `PURGE BINARY LOGS`＋nginxログ切詰（disk 100%枯渇でrun3 fail。sudo/SSH書込み＝**ユーザー認可待ち**） | infra | 計測再開の前提 | 低（破棄可能なlog/binlog） | ⏳認可待ち |
+| **6.5** | **（運用）ディスク恒久解放**: ログ切詰＋`PURGE BINARY LOGS`＋`disable_log_bin` | infra | **✅ disk 100%→70%・再増殖停止** | 低 | ✅完了(Step7に統合) |
+| **7** | **MySQL設定＋nginx静的/gzip/keepalive＋FD上限**（TUNING_LOG Step7+7b） | MySQL/app/nginx | **✅ 132k→156127 (+18%)・mysqld130→44%・壁がapp(Go)へ** | 中（FD上限の見落としで一度38k崩落→是正） | ✅完了 |
+
+### ▶ 進捗サマリ: 43.7k(S5) → 132k(S6) → **156k(S7)**。壁の変遷: DB律速→disk枯渇→FD枯渇→**app(Go) CPU(72.9%)**。次はGo CPU削減。
 | 7 | makePosts全ユーザー走査(67811回)の撲滅: 全ユーザーを memcache/メモリへcache（ban時invalidate）or 出現user_idをIN絞り | MySQL CPU/app | 中-大 | 中（ban整合） | 未 |
 | 8 | MySQL設定: buffer_pool 128MB→1GB(動的`SET GLOBAL`可), flush_log_at_trx_commit 1→2, sync_binlog/binlog OFF(要restart) | MySQL | 中 | 低-中（restart要否） | 未 |
 | 9 | app/nginx層: DSN `interpolateParams=true`+接続プール, テンプレ起動時1回パース, 静的css/js/faviconをnginx直配信+expires(304=+1点)+gzip+upstream keepalive | app/nginx | 中（DB解放後に効く） | 低 | 未 |
@@ -123,6 +126,6 @@ score = Σ(GET成功×1) + Σ(POST成功×3[=1+2]) + Σ(画像投稿成功×6[=5
 ---
 
 ## 5. 計測プロトコル（厳守）
-- **ウォームアップ1回（破棄）＋本計測3回の中央値**。単発はvariance大（冷間~21k/温間~43k）。
+- **ウォームアップ1回（破棄）＋本計測2回の中央値**（ユーザー要望でStep8以降3回→2回に短縮）。単発はvariance大。
 - 各Step: ローカル編集 → EC2デプロイ(`go build`→`systemctl restart isu-go`) → EXPLAIN/温間計測 → Verifier検証 → `tuning/TUNING_LOG.md`追記 → コミット。
 - 秘密情報(pem/credential/settings.local)はコミット除外。
