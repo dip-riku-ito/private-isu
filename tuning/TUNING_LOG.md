@@ -31,6 +31,7 @@
 | 13 | /posts?max_created_at= の nginxキャッシュ(proxy_cache) | **231540** | ~221000 | 0 | warm中央値(+13.3%)。GET/posts 41→0.00ms(HIT~100%)。app/mysqld両-3pt・CPU~25%遊休=GET/レイテンシ律速へ |
 | 14 | テンプレの reflect.Value.Call 排除（imageURL/CreatedAt.Format を事前計算フィールド化） | 229814 | ~219000 | 0 | warm中央値(横ばい・-0.7%=ノイズ内)。GET/ 13.16→12.55ms(-5%)・app46.6→45.6%は実現するもスコア不変＝micro-optの限界。出力バイト等価(Verifier PASS)・無害なので採用維持。※後の実測で頭打ちの真因は「**2vCPU CPU総量飽和**(負荷中idle 0%)」と判明（→Step15診断）。app1pt空けても飽和共有プールに即吸収 |
 | 15 | 匿名(未ログイン)GET/ の nginxキャッシュ(proxy_cache・Cookie有はbypass) | **244635** | ~232000 | 0 | warm中央値(+6.4%・+14.8k)。GET/ 12.55→5.03ms(-60%)・匿名41%が0ms HIT。残59%は認証workerでBYPASS→Goへ(ban/CSRF安全)。Reg試算+105kに届かぬのは①cache対象が匿名41%のみ②CPU飽和で解放分が再吸収。fail0 |
+| 16 | POST/ の画像BLOB DB書込み廃止（imgdata空・FS保存のみ） | **258645** | ~243000 | 0 | warm中央値(+5.7%・+14k)。DBダイジェスト#1=INSERT posts BLOB 16s/avg31msを排除。mysqld 47.5→35.9%(-11.6pt)・POST/ 32.59→9.33ms(-71%)・DB肥大停止(1.8G不変)。画像配信回帰なし(GET/image 200/実体)。壁は再びapp(Go)~49% |
 
 ---
 
@@ -610,3 +611,37 @@ Reg がbenchmarker実装で安全性を確認: benchmarker作者が `scenario.go
 ### 🎯 次のボトルネック（飽和下の最大レバー）
 - **SW（新HW不要）: mysqld~47%のDB側CPU削減**が最大の残レバー（飽和の最大単一消費）。候補: ①getSessionUserの毎リクSELECT(認証全リク)をsession(memcache)格納で排除 ②comment COUNT(*)非正規化/省略(benchは件数未検証) ③残クエリ最適化。※まず mysqld のクエリダイジェスト実測で当て推量を避ける(Step10 pprofのDB版)。
 - **HW（研修の本番ベンチ向け・ユーザー判断）: bench別ホスト化(+18〜42k) / 4vCPU化(690k圏)**。「マルチスレッド/マルチプロセス＝多コアスケール」はここで開花。事前に nginx `worker_processes auto`・Go `GOMAXPROCS`・GC削減(STW)を担保。
+
+---
+
+## Step 16: POST/ の画像BLOB DB書込み廃止（FS保存のみ）— score 258,645（+14k）
+
+### 背景（DBダイジェスト実測で確定）
+Step15後、mysqld~47%のDB-CPU削減を「当て推量せず」決めるため performance_schema の events_statements_summary_by_digest を採取（DB版pprof）。総時間Top:
+1. **INSERT INTO posts(…imgdata…) 16.06s / 515回 / avg31.2ms** ← 突出（他の50-100倍）。**Step3で画像配信はFS化済なのにPOST/が画像をDB BLOBにも二重書込み**していた＝純粋な無駄。
+2. comments本体 IN 9.04s / 3. users IN 6.89s / 4. comment COUNT 6.36s / 5. posts timeline 3.42s（getSessionUser id=? は2.94s/11612回=軽量）。
+- 多コア設定も確認: nginx worker_processes auto / Go GOMAXPROCS既定=NumCPU / MySQL bp_instances=8・io_threads4 ＝**単一コア縛りなし。大きい機にそのまま載れば全コアにスケール**（注: max_connections=151は多コア並列増時に要引上げ）。
+
+### 施策（webapp/golang/app.go postIndex）
+- INSERT posts の imgdata に `filedata` の代わりに `[]byte{}`（空・非nil）を渡す＝**BLOBをDBに書かない**。画像は saveImageFile が redirect 前に同期でFSへ書込み（唯一の保存先・nginx try_filesが配信）。
+- ハードニング（Verifier指摘）: main()冒頭に `os.MkdirAll("../public/image",0755)`。FSが唯一の保存先になったためdir不在による無言全滅を予防（dir存在時は挙動同一）。
+
+### 検証（Verifier 条件付きPASS / Bench 回帰チェック）
+- 新規投稿の画像はFSに同期書込み→nginxヒットで配信、getImage(DBフォールバック)は走らない。`[]byte{}`はNOT NULL制約を満たす（非nil空BLOB）。imgdataを読むのはgetImageのみで新規投稿は非経由＝空配信の経路なし。初期データ(id≤10000)のBLOBは不変でフォールバック維持。
+- Bench: サニティベンチ fail0、手動 **GET /image/29807.jpg → 200/106883bytes（FS実体）**。回帰なし。
+- 残リスク: FS書込が唯一のコピー（DB安全網喪失）。dir存在・disk74%・権限OK・Step3以降実績で実害なし＋MkdirAllで予防。
+
+### Before → After（warm中央値, warmup破棄+本2回）
+| 指標 | Step 15 | Step 16 |
+|---|---|---|
+| score | 244635 | **258645（+5.7%・+14k）** |
+| fail | 0 | 0 |
+| POST / avg | 32.59ms | **9.33ms (-71%)** |
+| mysqld %CPU | ~47.5 | **35.9 (-11.6pt)** |
+| app(Go) %CPU | 44.2 | **49.2**（mysqld解放分でスループット増→app再び最busy） |
+| /var/lib/mysql | (肥大) | **1.8G不変（DB肥大停止）** |
+
+### 🎯 次のボトルネック＝再び app(Go) ~49%
+- INSERT posts排除で mysqld は36%へ後退。**壁は app(Go) 49%** に戻った。
+- ＝次のDB側次点(usersキャッシュ~9.8s)は mysqld が緩んだ今は効きが薄い（appが律速）。伸ばすなら app側（makePostsのGo処理/template）か、根本の **2vCPU飽和→benchmarker別ホスト退避**（最大レバー・ユーザー判断）。
+- セッションこのStep13→16で 231.5k→258.6k（+11.7%）。ローカルは2vCPU飽和＋同居bench(35%)税で頭打ち圏。SW真天井~400kは*主催側の多コア/bench分離*で開花。

@@ -760,13 +760,17 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Step16: 画像はFSにのみ保存し、DBのimgdata BLOBには書かない（DB最大コスト=INSERT posts
+	// 16s/avg31msの排除）。配信はnginx静的(try_files)＝Step3で既にFS化済。imgdataはNOT NULLの
+	// ため空バイト列を入れる（行サイズが激減しINSERTがµs級に）。getImageのDBフォールバックは
+	// 新規投稿では走らない（下のsaveImageFileがredirect前に同期書込みするためFSに必ず存在）。
 	query := "INSERT INTO `posts` (`user_id`, `mime`, `imgdata`, `body`) VALUES (?,?,?,?)"
 	result, err := db.ExecContext(
 		ctx,
 		query,
 		me.ID,
 		mime,
-		filedata,
+		[]byte{},
 		r.FormValue("body"),
 	)
 	if err != nil {
@@ -780,7 +784,7 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 投稿画像をファイルにも書き出し、以後 nginx が静的配信できるようにする
+	// 投稿画像をファイルに書き出し、以後 nginx が静的配信する（DB BLOBの代替＝唯一の保存先）
 	saveImageFile(pid, mime, filedata)
 
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
@@ -911,6 +915,12 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Step16: 画像はFSが唯一の保存先（DB BLOB廃止）になったため、保存先dirの存在を起動時に保証。
+	// dir不在だと os.WriteFile が無言失敗し画像が全滅する（Verifier指摘の安全網）。
+	if err := os.MkdirAll("../public/image", 0755); err != nil {
+		log.Printf("failed to ensure image dir: %s", err)
+	}
+
 	host := os.Getenv("ISUCONP_DB_HOST")
 	if host == "" {
 		host = "localhost"
