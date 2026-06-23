@@ -465,7 +465,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 
 	results := []Post{}
 
-	err := db.SelectContext(ctx, &results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at FROM `posts` p JOIN `users` u ON p.user_id = u.id WHERE u.del_flg = 0 ORDER BY p.created_at DESC LIMIT 20")
+	err := db.SelectContext(ctx, &results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at FROM `posts` p FORCE INDEX (idx_created_at) STRAIGHT_JOIN `users` u ON p.user_id = u.id WHERE u.del_flg = 0 ORDER BY p.created_at DESC LIMIT 20")
 	if err != nil {
 		log.Print(err)
 		return
@@ -601,7 +601,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 	}
 
 	results := []Post{}
-	err = db.SelectContext(ctx, &results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at FROM `posts` p JOIN `users` u ON p.user_id = u.id WHERE p.created_at <= ? AND u.del_flg = 0 ORDER BY p.created_at DESC LIMIT 20", t.Format(ISO8601Format))
+	err = db.SelectContext(ctx, &results, "SELECT p.id, p.user_id, p.body, p.mime, p.created_at FROM `posts` p FORCE INDEX (idx_created_at) STRAIGHT_JOIN `users` u ON p.user_id = u.id WHERE p.created_at <= ? AND u.del_flg = 0 ORDER BY p.created_at DESC LIMIT 20", t.Format(ISO8601Format))
 	if err != nil {
 		log.Print(err)
 		return

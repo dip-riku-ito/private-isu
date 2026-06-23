@@ -22,6 +22,7 @@
 | 3 | 画像をFS化+nginx静的配信(expires) | 29764 | 28445 | 0 | warm中央値。冷間初回は~21k。expiresで+30% |
 | 4 | makePosts N+1解消 + initialize画像cleanup | 31085 | 29847 | 0 | warm中央値。disk逼迫を解消後の安定値(+4.4%) |
 | 5 | 投稿系クエリJOIN+LIMIT20 / getPostsID imgdata除外 / comments(user_id)索引 | **43763** | 42258 | 0 | warm中央値(+40.8%)。全1万行fetch→20行が主効果 |
+| 6 | タイムラインクエリ FORCE INDEX+STRAIGHT_JOIN（filesort排除） | **~132000** | ~127000 | 0 | warm clean2回値(約3倍)。GET/ 354→43.6ms(8x)。run3はディスク満杯でfail(infra) |
 
 ---
 
@@ -268,3 +269,50 @@ warm(discard) 44102 を破棄し、本計測3回: **43706 / 43763 / 44498**（�
 - ⚠️ `created_at` 同値タイ時の選択行は `ORDER BY created_at DESC`（2次ソート無し）+LIMITでMySQL任せの非決定性。ただし**旧実装も2次ソート無しで同じ**＝新規リグレッションではない（seedは created_at がほぼ一意で実害なし）。決定化したい場合は `created_at DESC, id DESC` の2次キー化。
 - ② Go接続プール制限 (`SetMaxOpenConns`) / makePostsの「全ユーザー取得(`SELECT ... FROM users`)」を出現post_idのuser_idで`IN`絞り込み / ⑦ MySQL設定 / ⑧ memcached / 静的(css/js)のnginx配信。
 - ⚠️ disk 使用率が93%まで上昇。ベンチ多数回後はディスク残量に注意（/initializeで頭打ちだが余裕は小さい）。
+
+---
+
+## Step 6: タイムラインクエリの実行計画矯正（FORCE INDEX + STRAIGHT_JOIN）— score ~132,000 (warm, clean runs)
+
+### 背景（Step5後の実機プロファイルで判明 / Agent Teams: Reg=規定 + Bench=実測 + Verifier=コード）
+- **負荷モデルはレイテンシ律速**（Reg）: ベンチは60秒固定・11並列ハードコード・ランプアップ無し → **score ∝ 1/平均レイテンシ**。現状≈15ms/req、400kには≈1.6ms/req（約10倍短縮）が必要。
+- **飽和tier=MySQL CPU**（Bench実測）: mysqld 129.7%/2vCPU（純CPU, %wait<1）, app 38.9%（うち22%はDB応答待ち）, nginx 8.2%, memcached 0.2%。app/nginxは余力ありDBが壁。
+- **真因**: タイムラインposts クエリが1リクで1〜2万行スキャン（GET/ 354ms, GET/posts 387ms）。Step5でLIMIT20を足したのに重いのは、`JOIN users WHERE del_flg=0 ORDER BY created_at DESC LIMIT 20` をオプティマイザが「idx_created_at早期終了」せず「~1万行をfilesort」する計画を選んでいたため（JOINクエリ実測 avg313ms/~1.1万行）。
+
+### 施策（webapp/golang/app.go）
+getIndex/getPosts のタイムラインクエリを `FROM posts p FORCE INDEX (idx_created_at) STRAIGHT_JOIN users u ON p.user_id=u.id WHERE ... ORDER BY p.created_at DESC LIMIT 20` に変更（WHERE/ORDER BY/LIMITは不変）。STRAIGHT_JOINで結合順序をposts→usersに固定、FORCE INDEXでidx_created_atを強制し、**索引逆順走査による早期終了（~21行）**に矯正。
+
+### EXPLAIN（矯正後）
+- getIndex: posts `key=idx_created_at` / **filesort無し** / Backward index scan / rows≈199、users eq_ref(PRIMARY)
+- getPosts: `key=idx_created_at` / **filesort無し** / range+Backward index scan（LIMIT20で早期終了）
+
+### Before → After
+| 指標 | Before (Step 5) | After (Step 6) |
+|---|---|---|
+| score | 43763 | **~132000（約3倍）** |
+| GET / avg | 354ms | **43.6ms (8.1x)** |
+| GET /posts avg | 387ms | **46.9ms (8.3x)** |
+| fail | 0 | 0（clean runs） |
+
+### 計測（温間）
+warm(破棄)130921 / run1 133175(succ128279,fail0) / run2 131767(succ126891,fail0) / **run3 139728(fail727・無効)**。run3のfailはコードでなく**ディスク満杯（infra）**。clean代表値 **≈132k**。
+
+### 検証（Verifier PASS）
+- STRAIGHT_JOIN/FORCE INDEX はオプティマイザヒントのみ。返る結果集合・順序（del_flg=0 の最新20件）は **Step5と完全同一**（Step5 correctness を保持）。imagePerPageChecker(≥20件)充足。
+- idx_created_at は 01_indexes.sql で永続（/initialize は索引をdropしない）。`go build`/`go vet` OK。
+- 留保: FORCE INDEX は対象索引が無いとフォールバックせず500化 → 索引適用が運用前提。
+
+### 考察
+mysqld CPUを食い潰していた filesort/全行スキャンを断ち、read avg が約1/8に。スコア約3倍。レイテンシ律速モデル（score∝1/latency）の裏付け。
+
+### ⚠️ 顕在化した運用課題: ディスク満杯（最優先・次対応）
+スコア3倍＝書込みスループット増で run3 中に `df / = 100%`（残45MB）。MySQLが /tmp 一時ファイルを書けず POST 500/timeout で fail727（GET系は正常）。要因: /var/lib/mysql 5.9G（**binlog 43本**＋posts.imgdata BLOB残存）, /home/isucon 5.2G（public/image 1.2G/1万枚）。
+- 安全是正: `PURGE BINARY LOGS`＋nginxアクセスログ切詰（sudo/SSH書込み＝**ユーザー認可待ち**。自動実行は分類器が拒否）。
+- 恒久是正（Step8/10）: binlog無効化（mysql再起動）、posts.imgdata列DROP（コード側でBLOB書込み停止後）。
+
+### 次の最適化候補
+1. **（運用・最優先）ディスク是正** → 計測再開可能に
+2. Step7: makePosts の全ユーザー走査（67811回/1.6ms）をキャッシュ or IN絞り
+3. Step8: MySQL設定（buffer_pool 128MB→1GB / binlog OFF / flush_log_at_trx_commit=2）
+4. Step9: app/nginx（interpolateParams+接続プール / テンプレ起動時1回パース / 静的css·js·faviconをnginx直配信+expires(304=+1点)+gzip+upstream keepalive）
+5. ⚠️ ベンチ同一2vCPUホスト相乗りの頭打ち（真の400kはベンチ別ホスト化が事実上前提）
