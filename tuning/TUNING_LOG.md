@@ -21,6 +21,7 @@
 | 2 | openssl除去(crypto/sha512) | 17891 | 16789 | 0 | パスワードハッシュをGo内製化。fail0維持 |
 | 3 | 画像をFS化+nginx静的配信(expires) | 29764 | 28445 | 0 | warm中央値。冷間初回は~21k。expiresで+30% |
 | 4 | makePosts N+1解消 + initialize画像cleanup | 31085 | 29847 | 0 | warm中央値。disk逼迫を解消後の安定値(+4.4%) |
+| 5 | 投稿系クエリJOIN+LIMIT20 / getPostsID imgdata除外 / comments(user_id)索引 | **43763** | 42258 | 0 | warm中央値(+40.8%)。全1万行fetch→20行が主効果 |
 
 ---
 
@@ -225,3 +226,45 @@ GET / 平均は 376ms → 299ms、GET /posts は 554ms → 270ms に短縮。
 ### 次の最適化候補（未適用）
 - **⑤(次) 投稿一覧クエリに LIMIT + del_flg を SQL側で**（getIndex/getPosts/getAccountName）: 1万行fetch→20行。GET / の本命。
 - ② Go接続プール制限 / ⑦ MySQL設定 / ⑧ memcached
+
+---
+
+## Step 5: 投稿系クエリ JOIN+LIMIT20 / getPostsID imgdata除外 / comments(user_id)索引 — score 43763 (warm中央値)
+
+### 背景
+Step4でmakePostsのN+1自体は解消したが、呼び出し側のクエリが依然非効率だった:
+- `getIndex`/`getPosts` が `SELECT ... FROM posts ORDER BY created_at DESC`（**LIMITなし＝全約1万行fetch**）して、del_flg判定と20件絞り込みをGo側(makePosts)で実施していた。GET / の本命ボトルネック。
+- `getAccountName` のプロフィールページで `SELECT COUNT(*) FROM comments WHERE user_id=?` が **comments(user_id)索引なし→10万行フルスキャン**。加えて投稿一覧も LIMITなし。
+- `getPostsID` が `SELECT *`（mediumblob imgdata込み）で、配信に使わない画像BLOBを毎回読み出し・転送していた（画像はStep3でFS/`/image/`配信化済み）。
+
+### 施策（webapp/golang/app.go ＋ tuning/02_indexes.sql）
+1. **getIndex / getPosts**: `JOIN users u ON p.user_id=u.id WHERE u.del_flg=0 ... ORDER BY p.created_at DESC LIMIT 20` に変更。del_flg判定と件数制限をDB側へ押し下げ、**全約1万行fetch→20行**に圧縮。
+2. **getAccountName**: 投稿一覧クエリに `LIMIT 20` 追加（本人プロフィールページのため del_flg JOINは不要＝本人は非削除確定。統計の postCount/commentCount/commentedCount は LIMITなしの別クエリで算出するため不変）。
+3. **getPostsID**: `SELECT *` → `SELECT id,user_id,body,mime,created_at`（**imgdata BLOB除外**）。getPostsID経由では imgdata 未参照のため無駄なBLOB読み出し・転送を排除。
+4. **comments(user_id) 索引追加**（`tuning/02_indexes.sql`）: getAccountName の `COUNT(*) FROM comments WHERE user_id=?` の10万行フルスキャンを解消。Step1の idx_post_created(post_id,created_at) とは別列で非重複。
+
+### Before → After（warm中央値）
+
+| 指標 | Before (Step 4) | After (Step 5) |
+|---|---|---|
+| score | 31085 | **43763** |
+| success | 29847 | 42258 |
+| fail | 0 | **0** |
+
+### 計測（温間プロトコル）
+warm(discard) 44102 を破棄し、本計測3回: **43706 / 43763 / 44498**（各 fail 0、success ~42195/42258/42973）→ **中央値 43763**。直近サニティ43768とほぼ一致。disk 1.1G空き(93%使用)・fail全回0で実害なし（/initialize の画像クリーンアップが頭打ちを維持）。
+
+### 検証（Verifier レビュー PASS）
+- **makePosts等価性**: 新SQLが返す20件は全て del_flg=0 のため makePosts の author フィルタで1件も落ちず、旧実装（全件fetch→Goでskip+先頭20件）と同一集合・同一順序。3コメント制限・count・降順取得後のreverse経路も不変。
+- **getAccountName**: 対象ユーザは del_flg=0 確認済みで全投稿が本人＝非削除。LIMIT20のみで等価。統計countは別クエリで不変。
+- **getPostsID imgdata除外**: テンプレート(templates/*.html)に Imgdata 参照なし。Post.Imgdata を読むのは getImage（独自に `SELECT mime,imgdata` 発行）のみで getPostsID と独立。描画影響なし。
+- **comments(user_id)索引**: base schemaは comments に PRIMARY(id)のみ。非重複・非衝突で COUNT クエリに直効。
+- `go build ./...` / `go vet ./...` ともに exit 0。
+
+### 考察
+- LIMITなし全約1万行fetchを20行に圧縮したのが主効果（GET / の本命）。索引追加とBLOB除外の相乗で **+40.8%（31085→43763）**。N+1解消(Step4)で1ページのクエリ本数は減っていたが、1クエリあたりの転送行数が支配的に残っていたことが裏付けられた。
+
+### 留保／次の最適化候補（未適用）
+- ⚠️ `created_at` 同値タイ時の選択行は `ORDER BY created_at DESC`（2次ソート無し）+LIMITでMySQL任せの非決定性。ただし**旧実装も2次ソート無しで同じ**＝新規リグレッションではない（seedは created_at がほぼ一意で実害なし）。決定化したい場合は `created_at DESC, id DESC` の2次キー化。
+- ② Go接続プール制限 (`SetMaxOpenConns`) / makePostsの「全ユーザー取得(`SELECT ... FROM users`)」を出現post_idのuser_idで`IN`絞り込み / ⑦ MySQL設定 / ⑧ memcached / 静的(css/js)のnginx配信。
+- ⚠️ disk 使用率が93%まで上昇。ベンチ多数回後はディスク残量に注意（/initializeで頭打ちだが余裕は小さい）。
