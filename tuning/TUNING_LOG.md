@@ -32,6 +32,7 @@
 | 14 | テンプレの reflect.Value.Call 排除（imageURL/CreatedAt.Format を事前計算フィールド化） | 229814 | ~219000 | 0 | warm中央値(横ばい・-0.7%=ノイズ内)。GET/ 13.16→12.55ms(-5%)・app46.6→45.6%は実現するもスコア不変＝micro-optの限界。出力バイト等価(Verifier PASS)・無害なので採用維持。※後の実測で頭打ちの真因は「**2vCPU CPU総量飽和**(負荷中idle 0%)」と判明（→Step15診断）。app1pt空けても飽和共有プールに即吸収 |
 | 15 | 匿名(未ログイン)GET/ の nginxキャッシュ(proxy_cache・Cookie有はbypass) | **244635** | ~232000 | 0 | warm中央値(+6.4%・+14.8k)。GET/ 12.55→5.03ms(-60%)・匿名41%が0ms HIT。残59%は認証workerでBYPASS→Goへ(ban/CSRF安全)。Reg試算+105kに届かぬのは①cache対象が匿名41%のみ②CPU飽和で解放分が再吸収。fail0 |
 | 16 | POST/ の画像BLOB DB書込み廃止（imgdata空・FS保存のみ） | **258645** | ~243000 | 0 | warm中央値(+5.7%・+14k)。DBダイジェスト#1=INSERT posts BLOB 16s/avg31msを排除。mysqld 47.5→35.9%(-11.6pt)・POST/ 32.59→9.33ms(-71%)・DB肥大停止(1.8G不変)。画像配信回帰なし(GET/image 200/実体)。壁は再びapp(Go)~49% |
+| 17 | users をプロセス内キャッシュ（id→User、ban/initで無効化） | **268322** | ~252000 | 0 | warm中央値(+3.7%・+9.7k)。usersクエリ34260→1704回(-95%・digest実測)・mysqld35.9→30.8%(-5pt)。ban回帰なし(timeline SQLがdel_flg=0でDB権威＋cache delete二重防御)。app(Go)49%横ばい(scanAll減を高スループットが相殺)。次DB大口はcomments(本体10.4s+件数7.7s) |
 
 ---
 
@@ -645,3 +646,36 @@ Step15後、mysqld~47%のDB-CPU削減を「当て推量せず」決めるため 
 - INSERT posts排除で mysqld は36%へ後退。**壁は app(Go) 49%** に戻った。
 - ＝次のDB側次点(usersキャッシュ~9.8s)は mysqld が緩んだ今は効きが薄い（appが律速）。伸ばすなら app側（makePostsのGo処理/template）か、根本の **2vCPU飽和→benchmarker別ホスト退避**（最大レバー・ユーザー判断）。
 - セッションこのStep13→16で 231.5k→258.6k（+11.7%）。ローカルは2vCPU飽和＋同居bench(35%)税で頭打ち圏。SW真天井~400kは*主催側の多コア/bench分離*で開花。
+
+---
+
+## Step 17: users のプロセス内キャッシュ — score 268,322（+9.7k）
+
+### 背景（app(Go)再pprofで方針確定）
+Step16後 app(Go)~49%が壁。再pprof(cum%): **html/template.Execute 30.5%（最大・reflect.Value.Call 14.9%）**、**session gob復号~9%（新発見）**、sqlx.SelectContext14.3%/scanAll7.8%、mallocgc(GC)14.8%。
+- session~9%は **gsm.MemcacheStore.Get が gorilla の per-request registry(`GetRegistry(r).Get`)を使用＝1リク1復号で既にデデュープ済**とソース確認→「session読み集約」は無効と判定（潰せない）。
+- → 安全に削れる **users参照（scanAll一部＋mysqld users 9.8s）** をキャッシュ化（Step17）。template(30.5%)はcode-gen要で高リスクのため後回し。
+
+### 施策（webapp/golang/app.go）
+- `userCacheMu sync.RWMutex` + `userCache map[int]User`。
+- selectUsersInto: cache一次参照→未キャッシュidのみ `SELECT id,account_name,del_flg,authority FROM users WHERE id IN(missing)` でDB取得→充填。authorityをSELECTに追加（getSessionUserがcache経由でauthority取得）。
+- getUserByID新設＋getSessionUserがそれ経由（毎リク `SELECT * users WHERE id=?` 排除）。session user_id は int/**int64**(register=LastInsertId)両対応。
+- 無効化: getInitialize で全クリア（dbInitializeがdel_flg再設定）、postAdminBanned で ban id を delete（次アクセスでdel_flg=1再読込）。
+
+### 検証（Verifier PASS）
+ban整合は二重防御で安全: ①timeline/profileのSQLが `JOIN users WHERE del_flg=0`＝DB権威でcache状態に非依存、②ban時delete＋initで全クリア、③un-banは/initのみ＝stale誤除外経路なし。理論的lost-invalidation raceはgetPostsID直GETに限定・bench非顕在。authority不変でcache常時正。int64対応はregisterユーザのログイン維持に必須。
+
+### Before → After（warm中央値）
+| 指標 | Step 16 | Step 17 |
+|---|---|---|
+| score | 258645 | **268322（+3.7%・+9.7k）** |
+| fail | 0 | 0 |
+| usersクエリ呼出/run | 34260 | **1704（-95%）** |
+| mysqld %CPU | 35.9 | **30.8（-5pt）** |
+| app(Go) %CPU | 49.2 | 49.3（横ばい・scanAll減を高スループットが相殺） |
+
+### 🎯 残ボトルネック
+- **app(Go) html/template 30.5%** が最大の単一レバー（未着手・code-gen要で高リスク）。
+- DB次点: **comments（本体10.4s＋COUNT 7.7s＝18s）**（cache or comment_count非正規化。benchは件数未検証）。
+- セッション復号~9%は registry デデュープ済で潰せない。
+- 飽和下でローカルは逓減だが、各SWは総work削減＝**主催側の多コア機で開花**。セッション通算 231.5k→268.3k（**+15.9%**, fail0維持）。

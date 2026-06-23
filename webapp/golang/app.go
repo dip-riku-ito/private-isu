@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bradfitz/gomemcache/memcache"
@@ -30,6 +31,14 @@ import (
 var (
 	db    *sqlx.DB
 	store *gsm.MemcacheStore
+)
+
+// Step17: users はほぼ不変（account_name/authority は固定、del_flg は ban/initialize でのみ変化）
+// なので id→User をプロセス内キャッシュし、makePosts/getSessionUser の毎リク users SELECT と
+// その行スキャン(scanAll)を排除する。無効化: /initialize で全クリア、ban で該当idを削除（次回DB再読込）。
+var (
+	userCacheMu sync.RWMutex
+	userCache   = make(map[int]User)
 )
 
 const (
@@ -146,14 +155,18 @@ func getSessionUser(r *http.Request) User {
 	if !ok || uid == nil {
 		return User{}
 	}
-
-	u := User{}
-
-	err := db.GetContext(ctx, &u, "SELECT * FROM `users` WHERE `id` = ?", uid)
-	if err != nil {
+	var id int
+	switch v := uid.(type) {
+	case int:
+		id = v
+	case int64:
+		id = int(v)
+	default:
 		return User{}
 	}
 
+	// Step17: userCache 経由（毎リクの SELECT users WHERE id=? を排除）。
+	u, _ := getUserByID(ctx, id)
 	return u
 }
 
@@ -171,11 +184,26 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 // selectUsersInto は id IN (ids) のユーザーを取得して dest マップへ詰める（重複idは呼び出し側で除去済み前提）。
+// Step17: プロセス内 userCache を一次参照し、未キャッシュidのみDBから取得して充填する。
 func selectUsersInto(ctx context.Context, dest map[int]User, ids []int) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	q, args, err := sqlx.In("SELECT `id`, `account_name`, `del_flg` FROM `users` WHERE `id` IN (?)", ids)
+	var missing []int
+	userCacheMu.RLock()
+	for _, id := range ids {
+		if u, ok := userCache[id]; ok {
+			dest[id] = u
+		} else {
+			missing = append(missing, id)
+		}
+	}
+	userCacheMu.RUnlock()
+	if len(missing) == 0 {
+		return nil
+	}
+
+	q, args, err := sqlx.In("SELECT `id`, `account_name`, `del_flg`, `authority` FROM `users` WHERE `id` IN (?)", missing)
 	if err != nil {
 		return err
 	}
@@ -183,10 +211,31 @@ func selectUsersInto(ctx context.Context, dest map[int]User, ids []int) error {
 	if err := db.SelectContext(ctx, &users, db.Rebind(q), args...); err != nil {
 		return err
 	}
+	userCacheMu.Lock()
 	for _, u := range users {
+		userCache[u.ID] = u
 		dest[u.ID] = u
 	}
+	userCacheMu.Unlock()
 	return nil
+}
+
+// getUserByID は単一ユーザーを userCache 経由で取得する（getSessionUser用）。
+func getUserByID(ctx context.Context, id int) (User, bool) {
+	userCacheMu.RLock()
+	u, ok := userCache[id]
+	userCacheMu.RUnlock()
+	if ok {
+		return u, true
+	}
+	var user User
+	if err := db.GetContext(ctx, &user, "SELECT `id`, `account_name`, `del_flg`, `authority` FROM `users` WHERE `id` = ?", id); err != nil {
+		return User{}, false
+	}
+	userCacheMu.Lock()
+	userCache[user.ID] = user
+	userCacheMu.Unlock()
+	return user, true
 }
 
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
@@ -406,6 +455,10 @@ func getInitialize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dbInitialize(ctx)
 	cleanupImageFiles()
+	// Step17: dbInitialize が del_flg を再設定するため userCache を全クリア（stale防止）。
+	userCacheMu.Lock()
+	userCache = make(map[int]User)
+	userCacheMu.Unlock()
 	w.WriteHeader(http.StatusOK)
 }
 
@@ -909,6 +962,12 @@ func postAdminBanned(w http.ResponseWriter, r *http.Request) {
 
 	for _, id := range r.Form["uid[]"] {
 		db.ExecContext(ctx, query, 1, id)
+		// Step17: ban した id を userCache から削除（次アクセスで del_flg=1 を再読込）。
+		if n, err := strconv.Atoi(id); err == nil {
+			userCacheMu.Lock()
+			delete(userCache, n)
+			userCacheMu.Unlock()
+		}
 	}
 
 	http.Redirect(w, r, "/admin/banned", http.StatusFound)
