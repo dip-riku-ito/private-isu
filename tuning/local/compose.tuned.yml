@@ -1,0 +1,89 @@
+# ローカル再現: チューニング版(isucon-tuning ブランチ = Step19 までの全施策入り)
+#   - 画像はFS配信(初期BLOBは dumpimages でFS書き出し) / nginxはStep3,7,13,15適用 / MySQLはStep7設定+索引
+#   - 固定スペック: ベースラインと同一(cpuset "0,1" 2コア共有 + mem合計3.5GB)
+#   - ベンチマーカーはホスト(macOS)側で実行
+# 実行: tuning/local/run.sh tuned  (索引適用・dumpimages まで自動化)
+name: isu-tuned
+
+services:
+  nginx:
+    image: nginx:1.30
+    depends_on:
+      app:
+        condition: service_started
+    volumes:
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/tuning/local/nginx-conf.d:/etc/nginx/conf.d:ro
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/webapp/public:/public:ro
+    ports:
+      - "80:80"
+    cpuset: "0,1"
+    mem_limit: 500m
+    networks: [isu]
+
+  app:
+    build:
+      # ホストでクロスコンパイル済みの server(linux/arm64, 静的) を載せるだけ。
+      # 社内TLS傍受でコンテナ内 go mod download が失敗するためビルドはホスト側で行う。
+      context: /Users/riku-ito/Workspaces/sandbox/private-isu/webapp/golang
+      dockerfile_inline: |
+        FROM debian:bookworm-slim
+        RUN adduser --disabled-password --gecos "" --no-create-home --uid 10001 appuser
+        USER appuser
+        WORKDIR /home/webapp
+        COPY server /bin/server
+        COPY templates ./templates
+        ENTRYPOINT ["/bin/server"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      memcached:
+        condition: service_started
+    environment:
+      ISUCONP_DB_HOST: mysql
+      ISUCONP_DB_PORT: 3306
+      ISUCONP_DB_USER: root
+      ISUCONP_DB_PASSWORD: root
+      ISUCONP_DB_NAME: isuconp
+      ISUCONP_MEMCACHED_ADDRESS: memcached:11211
+    volumes:
+      # app は ../public(=/home/public) に画像を書き出す。nginx の /public と同じホストディレクトリを共有。
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/webapp/public:/home/public
+    init: true
+    restart: unless-stopped
+    cpuset: "0,1"
+    mem_limit: 1000m
+    networks: [isu]
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql-tuned:/var/lib/mysql
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/webapp/sql:/docker-entrypoint-initdb.d:ro
+      # Step7/8 MySQL設定(buffer pool 1G / binlog無効 / flush=2)
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/tuning/my.cnf:/etc/mysql/conf.d/zz-tuning.cnf:ro
+    ports:
+      - "3306:3306"
+    cpuset: "0,1"
+    mem_limit: 1600m
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 600s
+    networks: [isu]
+
+  memcached:
+    image: memcached:1.6
+    cpuset: "0,1"
+    mem_limit: 400m
+    networks: [isu]
+
+volumes:
+  mysql-tuned:
+
+networks:
+  isu:

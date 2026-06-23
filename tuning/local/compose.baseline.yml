@@ -1,0 +1,89 @@
+# ローカル再現: ベースライン(チューニング前 = master の素のGo実装)
+#   - 画像はDB BLOB配信 / nginxは素のproxy / MySQLはデフォルト設定・索引なし
+#   - 固定スペック: 全サービスを cpuset "0,1"(2コア共有) + mem合計3.5GB に固定し、EC2 c6i.large を模擬
+#   - ベンチマーカーはホスト(macOS)側で実行するため、ここには含めない
+# 実行: docker compose -p isu-baseline -f tuning/local/compose.baseline.yml up -d --build
+name: isu-baseline
+
+services:
+  nginx:
+    image: nginx:1.30
+    depends_on:
+      app:
+        condition: service_started
+    volumes:
+      - /Users/riku-ito/Workspaces/sandbox/private-isu-baseline/webapp/etc/nginx/conf.d:/etc/nginx/conf.d:ro
+      - /Users/riku-ito/Workspaces/sandbox/private-isu-baseline/webapp/public:/public:ro
+    ports:
+      - "80:80"
+    cpuset: "0,1"
+    mem_limit: 500m
+    networks: [isu]
+
+  app:
+    build:
+      # ホストでクロスコンパイル済みの server(linux/arm64) を載せるだけ。
+      # 社内TLS傍受でコンテナ内 go mod download が失敗するためビルドはホスト側で行う。
+      # baseline(master)はパスワードハッシュで openssl バイナリにシェルアウトするため openssl 同梱。
+      context: /Users/riku-ito/Workspaces/sandbox/private-isu-baseline/webapp/golang
+      dockerfile_inline: |
+        FROM debian:bookworm-slim
+        RUN apt-get update -qq && apt-get install -y --no-install-recommends openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+        RUN adduser --disabled-password --gecos "" --no-create-home --uid 10001 appuser
+        USER appuser
+        WORKDIR /home/webapp
+        COPY server /bin/server
+        COPY templates ./templates
+        ENTRYPOINT ["/bin/server"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      memcached:
+        condition: service_started
+    environment:
+      ISUCONP_DB_HOST: mysql
+      ISUCONP_DB_PORT: 3306
+      ISUCONP_DB_USER: root
+      ISUCONP_DB_PASSWORD: root
+      ISUCONP_DB_NAME: isuconp
+      ISUCONP_MEMCACHED_ADDRESS: memcached:11211
+    volumes:
+      - /Users/riku-ito/Workspaces/sandbox/private-isu-baseline/webapp/public:/home/public
+    init: true
+    restart: unless-stopped
+    cpuset: "0,1"
+    mem_limit: 1000m
+    networks: [isu]
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql-baseline:/var/lib/mysql
+      # メインのリポジトリから初期dump(dump.sql.bz2)を読み込む(MySQL公式entrypointは.sql.bz2対応)
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/webapp/sql:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "3306:3306"
+    cpuset: "0,1"
+    mem_limit: 1600m
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 600s
+    networks: [isu]
+
+  memcached:
+    image: memcached:1.6
+    cpuset: "0,1"
+    mem_limit: 400m
+    networks: [isu]
+
+volumes:
+  mysql-baseline:
+
+networks:
+  isu:

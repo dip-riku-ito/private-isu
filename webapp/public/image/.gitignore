@@ -1,0 +1,3 @@
+# dumpimages がDB BLOBから生成する投稿画像(初期1万枚+ベンチ生成分)。コミットしない。
+*
+!.gitignore
