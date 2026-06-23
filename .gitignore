@@ -16,3 +16,8 @@ portal/tmp
 !/portal/log/.keep
 /portal/tmp
 .vagrant
+
+ws-default-keypair.pem
+# Claude Code local settings
+.claude/settings.local.json
+**.env
