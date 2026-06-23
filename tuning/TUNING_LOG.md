@@ -26,6 +26,7 @@
 | 7 | disk恒久解放(binlog off)＋MySQL(buffer1G/flush2)＋nginx静的/gzip/keepalive＋FD上限 | **156127** | ~151000 | 0 | warm中央値(+18%)。mysqld130→44%、壁がapp(Go)へ移行 |
 | 8 | DB接続プール(MaxOpen/Idle100)＋interpolateParams=true | **170721** | ~165000 | 0 | warm中央値(+9%)。mysqld %wait 2.6→0。app(Go)依然74%で壁 |
 | 9 | テンプレート起動時1回パース | **173720** | ~168000 | 0 | warm中央値(+1.7%)。app(Go)74→70.7%。パースは主因でなく効果限定 |
+| 10-11 | pprof診断→makePostsの全ユーザー走査(1000行)を必要user_idのIN取得へ | **204283** | ~195000 | 0 | warm中央値(+17.6%)。app(Go)70.7→50.3%、scanAll52→17%。壁がtemplate Execute(48%)へ |
 
 ---
 
@@ -431,3 +432,53 @@ Step8後も app(Go) usr CPU(64.5%) が壁。Verifier監査#6（ハンドラ毎�
 
 ### 次（Step10）
 **pprof でCPUプロファイル採取** → Go内訳（Execute vs クエリ vs ループ）を実測し、最大消費関数を特定して Step11 で狙い撃ち。
+
+---
+
+## Step 10: pprof 診断（CPUプロファイル）
+
+### 施策
+app.go に `_ "net/http/pprof"` import ＋ main で `go http.ListenAndServe("localhost:6060", nil)`（localhost束縛・chiの:8080とは別、外部非公開）。ベンチ走行中に `go tool pprof -top -seconds=30 http://localhost:6060/debug/pprof/profile` で採取。
+
+### 結果（cum%）— ホットパス実測
+- **main.makePosts 57.7%**（全CPUの過半）。うち **sqlx.SelectContext→scanAll 52.4%**（DB行のreflectionスキャン）。
+- html/template.Execute 22.0% / runtime.mallocgc 21.9%（上記由来GC）。
+- ハンドラ別: getIndex 42% / getPosts 20% / getPostsID 16%。
+- JSON/regexp/memcache/session は上位外（意外な消費なし）。
+→ 本丸は **makePosts が毎リク scan する行数**（特に `SELECT * FROM users` 全1000行）。N+1（クエリ数）でなく**行スキャン量**が問題と確定。
+
+---
+
+## Step 11: makePosts の全ユーザー走査を必要 user_id の IN 取得へ — score 204,283 (warm中央値)
+
+### 背景（ユーザー指摘も反映）
+「N+1バッチ化＝根本解決か？」の議論を経て整理: **コメントN+1は Step4で解消済**。pprofの scanAll 52% の正体は「クエリ数」でなく **`SELECT * FROM users`（毎リク全1000行）を reflection scan** していたこと。これを必要idだけに絞る（1000→数十行, 95%削減・ゼロリスク）。完全キャッシュ化(→0)は並行制御/無効化コストが残5%に見合わず、ここはIN絞りが適正サイズと判断。
+
+### 施策（webapp/golang/app.go）
+- ヘルパ `selectUsersInto(ctx, dest, ids)`: `SELECT id,account_name,del_flg FROM users WHERE id IN (ids)`。
+- makePosts: 全ユーザー取得を廃止 → ①resultsの投稿者idをIN取得 ②del_flg=0で最大20件選択 ③コメント件数/本体(既存IN) ④コメント投稿者idを追加IN取得 ⑤割当。`len(results)==0` 早期return。
+
+### Before → After（warm中央値, warmup+2）
+| 指標 | Step 9 | Step 11 |
+|---|---|---|
+| score | 173720 | **204283 (+17.6%)** |
+| fail | 0 | 0 |
+| app(Go) %CPU | 70.7 | **50.3 (-20pt)** |
+| mysqld %CPU | 45.3 | 50.5（拮抗） |
+| makePosts/scanAll cum | 57.7/52.4% | **17.8/~17%** |
+
+### 検証（Verifier PASS）
+旧（全ユーザーmap）と新（必要idのみ）で出力完全等価（Goのmapゼロ値がorphan idで旧と同挙動、del_flgフィルタ・CommentCount・コメント3件/全件・反転順・コメント投稿者解決すべて一致）。go build/vet OK。
+
+### 🎯 ボトルネック移動（pidstat / 再pprof）
+- app(Go) 50.3% / mysqld 50.5%（**~50/50拮抗**）。
+- 再pprof: makePosts DB scan 52%→17% に陥落。**新最大ホットパス = `html/template.Execute` 22%→47.9%**（reflect.Value.Call ~24%）。
+- 1リクの実CPU低下（30sサンプル 23.0s→15.3s）。
+
+### 考察
+「行スキャン量を減らす」中層施策が +17.6% と最大級。N+1（クエリ数）でなく**スキャン行数・再計算**が本質だったことの裏付け。次は template Execute（描画）と拮抗する mysqld。
+
+### 次（Step12 候補・根本層）
+- **★ /posts?max_created_at の nginxキャッシュ**（Reg試算 単独+48k・規定上安全か要確認＝コメント変化の影響）。
+- template Execute削減（reflect.Call圧縮）、comment_count非正規化（COUNT排除）、/@user軽量化。
+- ※400k可否(Reg): 同居2vCPU天井~390k、ベンチ別ホスト化は+4%（任意）。10倍差の主因はSW最適化の深さ＝到達可能。

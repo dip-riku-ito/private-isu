@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	_ "net/http/pprof"
 	"net/url"
 	"os"
 	"path"
@@ -165,15 +166,42 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 	}
 }
 
-func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	// 全ユーザーを一括取得してマップ化（旧実装の投稿者/コメント投稿者ごとの個別SELECTを排除）
-	var users []User
-	if err := db.SelectContext(ctx, &users, "SELECT `id`, `account_name`, `del_flg` FROM `users`"); err != nil {
-		return nil, err
+// selectUsersInto は id IN (ids) のユーザーを取得して dest マップへ詰める（重複idは呼び出し側で除去済み前提）。
+func selectUsersInto(ctx context.Context, dest map[int]User, ids []int) error {
+	if len(ids) == 0 {
+		return nil
 	}
-	userMap := make(map[int]User, len(users))
+	q, args, err := sqlx.In("SELECT `id`, `account_name`, `del_flg` FROM `users` WHERE `id` IN (?)", ids)
+	if err != nil {
+		return err
+	}
+	var users []User
+	if err := db.SelectContext(ctx, &users, db.Rebind(q), args...); err != nil {
+		return err
+	}
 	for _, u := range users {
-		userMap[u.ID] = u
+		dest[u.ID] = u
+	}
+	return nil
+}
+
+func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
+	if len(results) == 0 {
+		return []Post{}, nil
+	}
+
+	// 投稿者のユーザー情報だけを取得（旧実装の「全ユーザー走査」=毎リク1000行scanを排除）。
+	seen := make(map[int]struct{}, len(results))
+	authorIDs := make([]int, 0, len(results))
+	for _, p := range results {
+		if _, ok := seen[p.UserID]; !ok {
+			seen[p.UserID] = struct{}{}
+			authorIDs = append(authorIDs, p.UserID)
+		}
+	}
+	userMap := make(map[int]User, len(authorIDs))
+	if err := selectUsersInto(ctx, userMap, authorIDs); err != nil {
+		return nil, err
 	}
 
 	// 投稿者が削除されていない投稿を最大 postsPerPage 件まで選択（旧実装の挙動を維持）
@@ -233,15 +261,31 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 			if !allComments && len(commentMap[c.PostID]) >= 3 {
 				continue
 			}
-			c.User = userMap[c.UserID]
 			commentMap[c.PostID] = append(commentMap[c.PostID], c)
 		}
 	}
 
-	// 各投稿へ割り当て。コメントは降順取得後に反転して旧実装と同じ表示順にする
+	// コメント投稿者のユーザー情報を追加取得（投稿者と重複しない未取得idのみ）
+	commentAuthorIDs := make([]int, 0)
+	for _, cs := range commentMap {
+		for _, c := range cs {
+			if _, ok := seen[c.UserID]; !ok {
+				seen[c.UserID] = struct{}{}
+				commentAuthorIDs = append(commentAuthorIDs, c.UserID)
+			}
+		}
+	}
+	if err := selectUsersInto(ctx, userMap, commentAuthorIDs); err != nil {
+		return nil, err
+	}
+
+	// 各投稿へ割り当て。コメントは投稿者情報を埋め、降順取得後に反転して旧実装と同じ表示順にする
 	for i := range posts {
 		posts[i].CommentCount = countMap[posts[i].ID]
 		comments := commentMap[posts[i].ID]
+		for j := range comments {
+			comments[j].User = userMap[comments[j].UserID]
+		}
 		for a, b := 0, len(comments)-1; a < b; a, b = a+1, b-1 {
 			comments[a], comments[b] = comments[b], comments[a]
 		}
@@ -924,6 +968,11 @@ func main() {
 	r.Post("/admin/banned", postAdminBanned)
 	r.Get(`/@{accountName:[0-9a-zA-Z_]+}`, getAccountName)
 	r.Mount("/", http.FileServer(http.Dir("../public")))
+
+	// Step10: pprof（診断用）。DefaultServeMux に登録される net/http/pprof を localhost:6060 で公開。
+	go func() {
+		log.Println(http.ListenAndServe("localhost:6060", nil))
+	}()
 
 	log.Fatal(http.ListenAndServe(":8080", r))
 }
