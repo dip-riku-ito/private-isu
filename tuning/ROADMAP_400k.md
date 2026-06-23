@@ -113,7 +113,10 @@ score = Σ(GET成功×1) + Σ(POST成功×3[=1+2]) + Σ(画像投稿成功×6[=5
 
 | **8** | **DB接続プール＋interpolateParams=true** | app(Go)/MySQL | **✅ 156k→170721 (+9%)・mysqld %wait→0・app(Go)74%継続** | 低 | ✅完了 |
 
-### ▶ 進捗サマリ: 43.7k(S5) → 132k(S6) → 156k(S7) → **170.7k(S8)**。壁の変遷: DB律速→disk枯渇→FD枯渇→**app(Go) CPU(74%)が継続**。次はGo CPU単価削減（テンプレ事前パース→makPostsユーザーcache→/@user集計）。
+| **9** | **テンプレート起動時1回パース** | app(Go) | **✅ 170.7k→173720 (+1.7%)・app(Go)74→70.7%（効果限定＝パースは主因でない）** | 低 | ✅完了 |
+| **10** | **pprofでCPUプロファイル採取**→Go内訳実測→本丸特定 | app(Go) | 診断（次の優先度を正しく決めるため） | 低 | ⏳次 |
+
+### ▶ 進捗サマリ: 43.7k(S5) → 132k(S6) → 156k(S7) → 170.7k(S8) → **173.7k(S9)**。壁は **app(Go) CPU(70.7%)** 継続。app(Go)施策が逓減(+9%→+1.7%)のため、**Step10でpprof実測**しホットパスを特定してから本丸に当てる方針。
 | 7 | makePosts全ユーザー走査(67811回)の撲滅: 全ユーザーを memcache/メモリへcache（ban時invalidate）or 出現user_idをIN絞り | MySQL CPU/app | 中-大 | 中（ban整合） | 未 |
 | 8 | MySQL設定: buffer_pool 128MB→1GB(動的`SET GLOBAL`可), flush_log_at_trx_commit 1→2, sync_binlog/binlog OFF(要restart) | MySQL | 中 | 低-中（restart要否） | 未 |
 | 9 | app/nginx層: DSN `interpolateParams=true`+接続プール, テンプレ起動時1回パース, 静的css/js/faviconをnginx直配信+expires(304=+1点)+gzip+upstream keepalive | app/nginx | 中（DB解放後に効く） | 低 | 未 |

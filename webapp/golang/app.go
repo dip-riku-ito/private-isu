@@ -334,6 +334,23 @@ func getTemplPath(filename string) string {
 	return path.Join("templates", filename)
 }
 
+// テンプレートは起動時に1回だけパースする。旧実装はハンドラ毎に template.Must(ParseFiles) で
+// 毎リクエスト file I/O + パースしており app(Go) CPU の主因だった。
+// html/template はパース完了後の Execute が並行安全。
+var tmplFuncs = template.FuncMap{
+	"imageURL": imageURL,
+}
+
+var (
+	tmplLogin    = template.Must(template.New("layout.html").Funcs(tmplFuncs).ParseFiles(getTemplPath("layout.html"), getTemplPath("login.html")))
+	tmplRegister = template.Must(template.New("layout.html").Funcs(tmplFuncs).ParseFiles(getTemplPath("layout.html"), getTemplPath("register.html")))
+	tmplIndex    = template.Must(template.New("layout.html").Funcs(tmplFuncs).ParseFiles(getTemplPath("layout.html"), getTemplPath("index.html"), getTemplPath("posts.html"), getTemplPath("post.html")))
+	tmplUser     = template.Must(template.New("layout.html").Funcs(tmplFuncs).ParseFiles(getTemplPath("layout.html"), getTemplPath("user.html"), getTemplPath("posts.html"), getTemplPath("post.html")))
+	tmplPosts    = template.Must(template.New("posts.html").Funcs(tmplFuncs).ParseFiles(getTemplPath("posts.html"), getTemplPath("post.html")))
+	tmplPostID   = template.Must(template.New("layout.html").Funcs(tmplFuncs).ParseFiles(getTemplPath("layout.html"), getTemplPath("post_id.html"), getTemplPath("post.html")))
+	tmplBanned   = template.Must(template.New("layout.html").Funcs(tmplFuncs).ParseFiles(getTemplPath("layout.html"), getTemplPath("banned.html")))
+)
+
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dbInitialize(ctx)
@@ -349,10 +366,7 @@ func getLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("login.html")),
-	).Execute(w, struct {
+	tmplLogin.Execute(w, struct {
 		Me    User
 		Flash string
 	}{me, getFlash(w, r, "notice")})
@@ -389,10 +403,7 @@ func getRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("register.html")),
-	).Execute(w, struct {
+	tmplRegister.Execute(w, struct {
 		Me    User
 		Flash string
 	}{User{}, getFlash(w, r, "notice")})
@@ -477,16 +488,7 @@ func getIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("index.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	tmplIndex.Execute(w, struct {
 		Posts     []Post
 		Me        User
 		CSRFToken string
@@ -562,16 +564,7 @@ func getAccountName(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("user.html"),
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	tmplUser.Execute(w, struct {
 		Posts          []Post
 		User           User
 		PostCount      int
@@ -618,14 +611,7 @@ func getPosts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("posts.html").Funcs(fmap).ParseFiles(
-		getTemplPath("posts.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, posts)
+	tmplPosts.Execute(w, posts)
 }
 
 func getPostsID(w http.ResponseWriter, r *http.Request) {
@@ -659,15 +645,7 @@ func getPostsID(w http.ResponseWriter, r *http.Request) {
 
 	me := getSessionUser(r)
 
-	fmap := template.FuncMap{
-		"imageURL": imageURL,
-	}
-
-	template.Must(template.New("layout.html").Funcs(fmap).ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("post_id.html"),
-		getTemplPath("post.html"),
-	)).Execute(w, struct {
+	tmplPostID.Execute(w, struct {
 		Post Post
 		Me   User
 	}{p, me})
@@ -841,10 +819,7 @@ func getAdminBanned(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	template.Must(template.ParseFiles(
-		getTemplPath("layout.html"),
-		getTemplPath("banned.html")),
-	).Execute(w, struct {
+	tmplBanned.Execute(w, struct {
 		Users     []User
 		Me        User
 		CSRFToken string

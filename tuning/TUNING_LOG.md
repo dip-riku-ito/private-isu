@@ -25,6 +25,7 @@
 | 6 | タイムラインクエリ FORCE INDEX+STRAIGHT_JOIN（filesort排除） | **~132000** | ~127000 | 0 | warm clean2回値(約3倍)。GET/ 354→43.6ms(8x)。run3はディスク満杯でfail(infra) |
 | 7 | disk恒久解放(binlog off)＋MySQL(buffer1G/flush2)＋nginx静的/gzip/keepalive＋FD上限 | **156127** | ~151000 | 0 | warm中央値(+18%)。mysqld130→44%、壁がapp(Go)へ移行 |
 | 8 | DB接続プール(MaxOpen/Idle100)＋interpolateParams=true | **170721** | ~165000 | 0 | warm中央値(+9%)。mysqld %wait 2.6→0。app(Go)依然74%で壁 |
+| 9 | テンプレート起動時1回パース | **173720** | ~168000 | 0 | warm中央値(+1.7%)。app(Go)74→70.7%。パースは主因でなく効果限定 |
 
 ---
 
@@ -401,3 +402,32 @@ interpolateParams はバイナリ`[]byte`(imgdata)含め安全（driver v1.10.0 
 
 ### 次（Step9）
 **テンプレートの起動時1回パース**（現状ハンドラ毎に `template.Must(ParseFiles)`＝毎リクfile I/O+パース。高頻度HTML経路 GET//posts/@user のusr CPU直撃）。
+
+---
+
+## Step 9: テンプレートの起動時1回パース — score 173,720 (warm中央値)
+
+### 背景
+Step8後も app(Go) usr CPU(64.5%) が壁。Verifier監査#6（ハンドラ毎の `template.Must(ParseFiles)`＝毎リク file I/O+パース）を解消。
+
+### 施策（webapp/golang/app.go）
+7テンプレート（login/register/index/user/posts/post_id/banned）を package-level var で**起動時に1回パース**、ハンドラは `Execute` のみに。`fmap`(={"imageURL":imageURL})を `tmplFuncs` に共通化。
+
+### Before → After（warm中央値, warmup+2）
+| 指標 | Step 8 | Step 9 |
+|---|---|---|
+| score | 170721 | **173720 (+1.7%)** |
+| fail | 0 | 0 |
+| app(Go) %CPU | 74.1 | 70.7 (-3.4pt) |
+| GET / avg | 41.0ms | 38.7ms |
+
+### 検証（Verifier PASS）
+7経路すべて旧と同じ named template・同じファイル集合を Execute＝**HTML出力完全同一**。funcmap付与（login/register/banned）は未参照で無害。html/template はパース後 Execute 並行安全。init時パースは cwd=webapp/golang で成立・テンプレ欠落時 fail-fast。go build/vet OK。
+
+### 考察・方針転換
+- テンプレパース排除は app CPU を **-3.4pt / +1.7%** に留まり、**パースは主因ではなかった**。
+- app(Go)施策の逓減（interpolateParams +9% → テンプレ +1.7%）＝usr CPUは分散。**当て推量を止め、pprofでホットパスを実測特定してから本丸に当てる**方針に転換（Step10）。
+- 残る app(Go) 候補: makePostsの全ユーザー走査(毎リク `SELECT * users`)＋処理ループ、template Execute(描画)、/@userの集計クエリ群。
+
+### 次（Step10）
+**pprof でCPUプロファイル採取** → Go内訳（Execute vs クエリ vs ループ）を実測し、最大消費関数を特定して Step11 で狙い撃ち。
