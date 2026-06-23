@@ -166,51 +166,86 @@ func getFlash(w http.ResponseWriter, r *http.Request, key string) string {
 }
 
 func makePosts(ctx context.Context, results []Post, csrfToken string, allComments bool) ([]Post, error) {
-	var posts []Post
+	// 全ユーザーを一括取得してマップ化（旧実装の投稿者/コメント投稿者ごとの個別SELECTを排除）
+	var users []User
+	if err := db.SelectContext(ctx, &users, "SELECT `id`, `account_name`, `del_flg` FROM `users`"); err != nil {
+		return nil, err
+	}
+	userMap := make(map[int]User, len(users))
+	for _, u := range users {
+		userMap[u.ID] = u
+	}
 
+	// 投稿者が削除されていない投稿を最大 postsPerPage 件まで選択（旧実装の挙動を維持）
+	posts := make([]Post, 0, postsPerPage)
 	for _, p := range results {
-		err := db.GetContext(ctx, &p.CommentCount, "SELECT COUNT(*) AS `count` FROM `comments` WHERE `post_id` = ?", p.ID)
-		if err != nil {
-			return nil, err
+		author := userMap[p.UserID]
+		if author.DelFlg != 0 {
+			continue
 		}
-
-		query := "SELECT * FROM `comments` WHERE `post_id` = ? ORDER BY `created_at` DESC"
-		if !allComments {
-			query += " LIMIT 3"
-		}
-		var comments []Comment
-		err = db.SelectContext(ctx, &comments, query, p.ID)
-		if err != nil {
-			return nil, err
-		}
-
-		for i := range comments {
-			err := db.GetContext(ctx, &comments[i].User, "SELECT * FROM `users` WHERE `id` = ?", comments[i].UserID)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		// reverse
-		for i, j := 0, len(comments)-1; i < j; i, j = i+1, j-1 {
-			comments[i], comments[j] = comments[j], comments[i]
-		}
-
-		p.Comments = comments
-
-		err = db.GetContext(ctx, &p.User, "SELECT * FROM `users` WHERE `id` = ?", p.UserID)
-		if err != nil {
-			return nil, err
-		}
-
+		p.User = author
 		p.CSRFToken = csrfToken
-
-		if p.User.DelFlg == 0 {
-			posts = append(posts, p)
-		}
+		posts = append(posts, p)
 		if len(posts) >= postsPerPage {
 			break
 		}
+	}
+	if len(posts) == 0 {
+		return posts, nil
+	}
+
+	postIDs := make([]int, len(posts))
+	for i := range posts {
+		postIDs[i] = posts[i].ID
+	}
+
+	// コメント件数を一括取得
+	countMap := make(map[int]int, len(posts))
+	{
+		q, args, err := sqlx.In("SELECT `post_id`, COUNT(*) AS `count` FROM `comments` WHERE `post_id` IN (?) GROUP BY `post_id`", postIDs)
+		if err != nil {
+			return nil, err
+		}
+		var counts []struct {
+			PostID int `db:"post_id"`
+			Count  int `db:"count"`
+		}
+		if err := db.SelectContext(ctx, &counts, db.Rebind(q), args...); err != nil {
+			return nil, err
+		}
+		for _, c := range counts {
+			countMap[c.PostID] = c.Count
+		}
+	}
+
+	// コメント本体を一括取得（post_idごとに created_at 降順）。!allComments なら各投稿の最新3件のみ採用
+	commentMap := make(map[int][]Comment, len(posts))
+	{
+		q, args, err := sqlx.In("SELECT * FROM `comments` WHERE `post_id` IN (?) ORDER BY `post_id`, `created_at` DESC, `id` DESC", postIDs)
+		if err != nil {
+			return nil, err
+		}
+		var comments []Comment
+		if err := db.SelectContext(ctx, &comments, db.Rebind(q), args...); err != nil {
+			return nil, err
+		}
+		for _, c := range comments {
+			if !allComments && len(commentMap[c.PostID]) >= 3 {
+				continue
+			}
+			c.User = userMap[c.UserID]
+			commentMap[c.PostID] = append(commentMap[c.PostID], c)
+		}
+	}
+
+	// 各投稿へ割り当て。コメントは降順取得後に反転して旧実装と同じ表示順にする
+	for i := range posts {
+		posts[i].CommentCount = countMap[posts[i].ID]
+		comments := commentMap[posts[i].ID]
+		for a, b := 0, len(comments)-1; a < b; a, b = a+1, b-1 {
+			comments[a], comments[b] = comments[b], comments[a]
+		}
+		posts[i].Comments = comments
 	}
 
 	return posts, nil
@@ -251,6 +286,29 @@ func saveImageFile(id int64, mime string, data []byte) {
 	_ = os.WriteFile(fmt.Sprintf("../public/image/%d.%s", id, ext), data, 0644)
 }
 
+// 初期データ外(id>10000)の画像ファイルを削除し、/initialize 後の状態をクリーンに保つ。
+// dbInitialize が posts WHERE id>10000 を削除するのに合わせる（ディスク肥大・再起動耐性対策）。
+func cleanupImageFiles() {
+	entries, err := os.ReadDir("../public/image")
+	if err != nil {
+		return
+	}
+	for _, e := range entries {
+		name := e.Name()
+		dot := strings.IndexByte(name, '.')
+		if dot <= 0 {
+			continue
+		}
+		id, err := strconv.Atoi(name[:dot])
+		if err != nil {
+			continue
+		}
+		if id > 10000 {
+			os.Remove("../public/image/" + name)
+		}
+	}
+}
+
 func isLogin(u User) bool {
 	return u.ID != 0
 }
@@ -279,6 +337,7 @@ func getTemplPath(filename string) string {
 func getInitialize(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	dbInitialize(ctx)
+	cleanupImageFiles()
 	w.WriteHeader(http.StatusOK)
 }
 

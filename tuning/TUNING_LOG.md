@@ -20,6 +20,7 @@
 | 1 | インデックス追加 | **16028** | 15078 | 0 | comments(post_id,created_at)他。fail0達成 |
 | 2 | openssl除去(crypto/sha512) | 17891 | 16789 | 0 | パスワードハッシュをGo内製化。fail0維持 |
 | 3 | 画像をFS化+nginx静的配信(expires) | 29764 | 28445 | 0 | warm中央値。冷間初回は~21k。expiresで+30% |
+| 4 | makePosts N+1解消 + initialize画像cleanup | 31085 | 29847 | 0 | warm中央値。disk逼迫を解消後の安定値(+4.4%) |
 
 ---
 
@@ -183,3 +184,44 @@ location @app { proxy_set_header Host $host; proxy_pass http://localhost:8080; }
 - ② Go接続プール制限 (`SetMaxOpenConns`)
 - ⑦ MySQL設定チューニング
 - ⑧ memcachedキャッシュ活用
+
+---
+
+## Step 4: makePosts N+1解消 + /initialize 画像クリーンアップ — score 31085 (warm中央値)
+
+### 背景
+Step3後の再プロファイルで GET / が 291s と依然最大。makePosts が1ページ(最大20投稿)あたり約120クエリ（投稿ごとに COUNT・コメント・各コメント投稿者・投稿者を個別SELECT）を発行していた。
+
+### 施策（webapp/golang/app.go）
+1. **makePosts を一括取得に全面書き換え**:
+   - `SELECT id, account_name, del_flg FROM users` で全ユーザーをmap化（コメント投稿者/投稿者の個別SELECTを排除）
+   - 投稿者 del_flg=0 のみ最大20件選択（旧挙動維持）
+   - `sqlx.In` で `comments WHERE post_id IN(...) GROUP BY post_id`（件数）と `... IN(...) ORDER BY post_id, created_at DESC, id DESC`（本体）を一括取得し、Go側でpost_id別に振り分け・最新3件・reverse
+   - 1ページ約120クエリ → 約3クエリ
+2. **getInitialize に画像クリーンアップ追加** (`cleanupImageFiles`): `posts WHERE id>10000` のDB削除に合わせ `public/image/{id>10000}` を削除。
+
+### Before → After（warm中央値）
+
+| 指標 | Before (Step 3) | After (Step 4) |
+|---|---|---|
+| score | 29764 | **31085** |
+| success | 28445 | 29847 |
+| fail | 0 | **0** |
+
+GET / 平均は 376ms → 299ms、GET /posts は 554ms → 270ms に短縮。
+
+### ⚠️ 計測の落とし穴（重要な学び）
+当初の計測が 27906→21814→18179 と**run毎に逓減**し混乱した。真因は **ディスク96%満杯**：ベンチがPOSTする画像ファイルが毎回 `public/image/` に蓄積し（旧 /initialize はDB行のみ削除しファイルを残していた）、ディスク逼迫でFS/DBが劣化していた。
+- 対処: 蓄積ゴミ(id>10000, 1830件/0.8GB)を削除 → disk 96%→90%。さらに getInitialize に cleanupImageFiles を追加し**毎initializeで自動クリーンアップ**（計測後もファイル数~10000で頭打ち、無限肥大しない）。
+- 教訓: スコア逓減トレンドはvarianceではなくシステム劣化のサイン。FS化施策には**初期化時のファイル整合（再起動耐性）**が必須。
+
+### 検証
+- Verifier レビュー PASS（DOM不変・SQL等価・コメント順/reverse・del_flg・LIMIT3相当・POST即時反映・go build/vet OK）。
+- 安定計測: 31126/31085/30337（fail 0）。disk 1.3G空き維持、画像ファイル数 ~10000 で安定。
+
+### 考察
+- N+1自体は解消したが、GET / は呼び出し側 `getIndex` の `SELECT ... FROM posts ORDER BY created_at DESC`（**LIMITなし=全1万行fetch**）が新たな主因として顕在化。伸びが+4.4%に留まったのはこのため。
+
+### 次の最適化候補（未適用）
+- **⑤(次) 投稿一覧クエリに LIMIT + del_flg を SQL側で**（getIndex/getPosts/getAccountName）: 1万行fetch→20行。GET / の本命。
+- ② Go接続プール制限 / ⑦ MySQL設定 / ⑧ memcached
