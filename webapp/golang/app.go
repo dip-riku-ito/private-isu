@@ -58,6 +58,10 @@ type Post struct {
 	Comments     []Comment
 	User         User
 	CSRFToken    string
+	// Step14: テンプレレンダリング時の reflect.Value.Call を排除するため、
+	// 旧 {{imageURL .}} / {{.CreatedAt.Format ...}} を事前計算した素の文字列フィールドに置換。
+	ImageURL     string
+	CreatedAtFmt string
 }
 
 type Comment struct {
@@ -213,6 +217,9 @@ func makePosts(ctx context.Context, results []Post, csrfToken string, allComment
 		}
 		p.User = author
 		p.CSRFToken = csrfToken
+		// Step14: テンプレ側の関数呼び出し/メソッド呼び出し(reflect.Value.Call)を消すため事前計算
+		p.ImageURL = imageURL(p)
+		p.CreatedAtFmt = p.CreatedAt.Format(ISO8601Format)
 		posts = append(posts, p)
 		if len(posts) >= postsPerPage {
 			break

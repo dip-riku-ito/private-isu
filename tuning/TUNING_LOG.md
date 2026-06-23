@@ -29,6 +29,7 @@
 | 10-11 | pprof診断→makePostsの全ユーザー走査(1000行)を必要user_idのIN取得へ | **204283** | ~195000 | 0 | warm中央値(+17.6%)。app(Go)70.7→50.3%、scanAll52→17%。壁がtemplate Execute(48%)へ |
 | 12 | (不採用)コメントROW_NUMBER 3件限定 | 200860 | - | 0 | -1.7%。app→mysqld荷移動で純減→revert |
 | 13 | /posts?max_created_at= の nginxキャッシュ(proxy_cache) | **231540** | ~221000 | 0 | warm中央値(+13.3%)。GET/posts 41→0.00ms(HIT~100%)。app/mysqld両-3pt・CPU~25%遊休=GET/レイテンシ律速へ |
+| 14 | テンプレの reflect.Value.Call 排除（imageURL/CreatedAt.Format を事前計算フィールド化） | 229814 | ~219000 | 0 | warm中央値(横ばい・-0.7%=ノイズ内)。GET/ 13.16→12.55ms(-5%)・app46.6→45.6%は実現するもスコア不変＝**もはやapp per-req CPU/レイテンシ律速でない**ことが判明（CPU25%遊休のまま頭打ち）。出力バイト等価(Verifier PASS)・無害なので採用維持 |
 
 ---
 
@@ -533,3 +534,39 @@ X-Cache HIT率~100%（probe全HIT）。GET /posts は n=7040 で avg 0.00ms＝ng
 - **GET / の template Execute 高速化**（code-gen テンプレ/reflection削減）＝GET/レイテンシ直撃。
 - or GET / の匿名版キャッシュ+ログイン時動的注入（690k戦略としてReg精査中）。
 - ※690k目標: Reg再分析中（現HWのSW天井 vs 増コア必要性）。
+
+---
+
+## Step 14: テンプレの reflect.Value.Call 排除（事前計算フィールド化） — score 229,814（横ばい・重要な診断）
+
+### 背景・狙い
+Step13後、CPU~25%遊休＝GET/(13.16ms・最多リク)のレイテンシ律速と判断。pprofで GET/ コストは template Execute 48%、うち **reflect.Value.Call 24%**。全テンプレ中 reflect.Value.Call を起こすのは post.html の3箇所のみ（投稿1件ごと発火＝GET/で20件×3）: `{{imageURL .}}`(FuncMap関数)・`{{.CreatedAt.Format ...}}`(メソッド×2)。他は全部フィールドアクセスか eq/if/range ビルトイン（Call不使用）。
+
+### 施策（webapp/golang/）
+- Post struct に `ImageURL string` / `CreatedAtFmt string` を追加。
+- makePosts の投稿選択ループ（全描画経路の唯一の集約点）で `p.ImageURL = imageURL(p)` / `p.CreatedAtFmt = p.CreatedAt.Format(ISO8601Format)` を append 前に事前計算。
+- templates/post.html の3箇所をフィールド参照に置換（`{{.ImageURL}}` / `{{.CreatedAtFmt}}`×2）。
+
+### 検証（Verifier PASS）
+3経路すべてバイト等価。html/template の文脈依存エスケープは「値の型(string)＋配置文脈」で決まり func戻り値かfieldかは無関係（src=URL文脈/data-created-at・datetime=属性文脈で同一escaper）。ISO8601Format=="2006-01-02T15:04:05-07:00" がpost.htmlリテラルと一致。post.htmlを含む4テンプレ(index/user/posts/postID)対応ハンドラは全て makePosts 経由。imageURL FuncMap未参照化は無害。go build/vet OK。
+
+### Before → After（warm中央値, warmup破棄+本2回）
+| 指標 | Step 13 | Step 14 |
+|---|---|---|
+| score | 231540 | 229814（**横ばい・-0.7%=ノイズ内**） |
+| fail | 0 | 0 |
+| GET / avg | 13.16ms | **12.55ms (-5%)** |
+| GET /@user avg | 18.49ms | 17.50ms (-5%) |
+| app(Go) %CPU | 46.6 | 45.6 (-1pt) |
+| mysqld %CPU | 47.5 | 48.4 |
+
+### 🎯 重要な診断: 「もはや app per-request CPU/レイテンシ律速ではない」
+- 狙い通りGET/レイテンシ-5%・app CPU-1ptは**実現**したのに**スコアは不変**。
+- 理由: success~219k/60s ＝ **~3650 req/s**。11固定workerで blended latency ≈ 3ms（多数のnginx静的/キャッシュ済/posts(0ms)応答で希釈）。GET/(12.5ms)は最多*回数*だが*総worker時間*では少数派 → GET/を5%削っても blended は ~0.3%しか動かず、run間変動(±3%, run1 233460/run2 226167)に埋もれる。
+- CPUは app45.6+mysqld48.4+nginx21.3+bench32.3 ≈ 148%/200 で**~25%遊休のまま頭打ち**。
+- ＝単機能のper-req CPU/レイテンシ削り(micro-opt)はもう費用対効果が逓減。次は「経路を丸ごと外す(キャッシュ)」か「HW(bench別ホスト/増コア)」の構造的レバー。
+
+### 次（Step15: 構造的レバーの選択 — Reg精査中）
+- 仮説(a): 同居benchmarker(32%CPU・固定11worker)のクライアント側律速 → bench別ホスト/増vCPUで一段上がる見込み（旧+2-4%見積もりはapp-CPU律速時のもの。遊休頭打ちの今は上振れ可能性）。
+- 仮説(b): サーバ側残存律速（session memcache往復/MySQLレイテンシ/per-req固定費）。
+- SW最大レバー: GET/(最多・非キャッシュ)を丸ごとキャッシュ。ただしGET/は新規投稿(2026)が先頭に来て不変でない→短TTL or fragmentキャッシュの安全性をReg確認中。
