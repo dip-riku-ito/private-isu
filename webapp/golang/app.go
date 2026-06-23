@@ -229,6 +229,28 @@ func imageURL(p Post) string {
 	return "/image/" + strconv.Itoa(p.ID) + ext
 }
 
+func mimeToExt(mime string) string {
+	switch mime {
+	case "image/jpeg":
+		return "jpg"
+	case "image/png":
+		return "png"
+	case "image/gif":
+		return "gif"
+	}
+	return ""
+}
+
+// 画像を public/image/{id}.{ext} に書き出して以後 nginx が静的配信できるようにする。
+// アプリの WorkingDirectory は webapp/golang なので ../public を指す。
+func saveImageFile(id int64, mime string, data []byte) {
+	ext := mimeToExt(mime)
+	if ext == "" {
+		return
+	}
+	_ = os.WriteFile(fmt.Sprintf("../public/image/%d.%s", id, ext), data, 0644)
+}
+
 func isLogin(u User) bool {
 	return u.ID != 0
 }
@@ -670,6 +692,9 @@ func postIndex(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 投稿画像をファイルにも書き出し、以後 nginx が静的配信できるようにする
+	saveImageFile(pid, mime, filedata)
+
 	http.Redirect(w, r, "/posts/"+strconv.FormatInt(pid, 10), http.StatusFound)
 }
 
@@ -683,7 +708,7 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	post := Post{}
-	err = db.GetContext(ctx, &post, "SELECT * FROM `posts` WHERE `id` = ?", pid)
+	err = db.GetContext(ctx, &post, "SELECT `mime`, `imgdata` FROM `posts` WHERE `id` = ?", pid)
 	if err != nil {
 		log.Print(err)
 		return
@@ -694,6 +719,8 @@ func getImage(w http.ResponseWriter, r *http.Request) {
 	if ext == "jpg" && post.Mime == "image/jpeg" ||
 		ext == "png" && post.Mime == "image/png" ||
 		ext == "gif" && post.Mime == "image/gif" {
+		// write-through: 次回以降は nginx が静的配信できるようファイルへ書き出す
+		saveImageFile(int64(pid), post.Mime, post.Imgdata)
 		w.Header().Set("Content-Type", post.Mime)
 		_, err := w.Write(post.Imgdata)
 		if err != nil {

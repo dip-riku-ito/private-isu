@@ -19,6 +19,7 @@
 | 0 | Go初期ベースライン | 0 | 643 | 55 | 索引なしN+1でMySQL飽和→timeout多発 |
 | 1 | インデックス追加 | **16028** | 15078 | 0 | comments(post_id,created_at)他。fail0達成 |
 | 2 | openssl除去(crypto/sha512) | 17891 | 16789 | 0 | パスワードハッシュをGo内製化。fail0維持 |
+| 3 | 画像をFS化+nginx静的配信(expires) | 29764 | 28445 | 0 | warm中央値。冷間初回は~21k。expiresで+30% |
 
 ---
 
@@ -130,3 +131,55 @@ func digest(ctx context.Context, src string) string {
 - ③ 画像をDB BLOB→FS化＋nginx静的配信（try_files fallback, immutable, 304自動）… 最多リクエスト/約163s
 - ④ makePosts N+1解消（GET / 224s 等の最大バケット）
 - ② Go接続プール制限 / ⑥ nginx静的最適化 / ⑦ MySQL設定 / ⑧ memcached
+
+---
+
+## Step 3: 画像をDB BLOB→FS化 + nginx静的配信 — score 29764 (warm中央値)
+
+### 背景（Step2後の再プロファイル）
+GET /image が jpg 104s/6553req + png 59s/2281req = 約163s・8834リクエストで最多。getImage が `SELECT * FROM posts`(mediumblob) をGoで配信していた。
+
+### 施策
+
+1. **既存画像の一括FS書き出し**: `webapp/golang/cmd/dumpimages/main.go` でDBの全imgdataを `public/image/{id}.{ext}` へ出力（10062件/1.3GB/8.3秒）。
+2. **app.go**: `getImage` を `SELECT mime,imgdata` に絞り、配信時にファイルへ write-through。`postIndex` で投稿時にファイル書き出し。`mimeToExt`/`saveImageFile` ヘルパ追加。
+3. **nginx**: `/image/` を `try_files $uri @app;` で静的配信（無ければGoへフォールバック）＋ `expires 1d;`。
+
+```nginx
+location /image/ { try_files $uri @app; expires 1d; }
+location @app { proxy_set_header Host $host; proxy_pass http://localhost:8080; }
+```
+
+### Before → After（warm中央値）
+
+| 指標 | Before (Step 2) | After (Step 3) |
+|---|---|---|
+| score | 17891 | **29764** |
+| success | 16789 | 28445 |
+| fail | 0 | **0** |
+
+`/image/1.jpg` は nginx静的配信を確認（Last-Modified/ETag/Accept-Ranges）。
+
+### 実験：Cache-Control(expires) の効果を controlled 比較（温間×3）
+
+| 構成 | scores | 中央値 |
+|---|---|---|
+| expires ON | 29914/29656/30073, 29577/29918/29764 | ~29.8k |
+| expires OFF | 23485/23059/22864 | 23059 |
+
+→ **expiresで約 23k→30k（+30%）**。ベンチがクライアントキャッシュを尊重し画像再取得をスキップするため。correctnessは安全（画像はid単位で不変、新規投稿は別URLでキャッシュミス→即取得、fail0）。
+
+### 学び：計測プロトコル
+- スコアのrun間variance大（冷間初回~21k ↔ 温間~30k）。**ウォームアップ1回（破棄）＋3回計測の中央値**を以後の標準プロトコルとする。単発計測は誤判断を招く（本Stepで「expires無influence」と一度誤結論しかけた）。
+
+### 検証
+- nginx静的配信をヘッダで確認。`go build` 成功。ベンチ fail 0。再起動耐性: 画像ファイル・索引はディスク永続。
+
+### 考察
+- DBからのBLOB読み出し+Go配信が消え、nginxのsendfileで直接配信。さらにexpiresによるブラウザキャッシュ活用で画像再取得が激減し、約+67%（17891→29764）を達成。
+
+### 次の最適化候補（未適用）
+- ④ makePosts N+1解消（GET / が依然最大バケット）
+- ② Go接続プール制限 (`SetMaxOpenConns`)
+- ⑦ MySQL設定チューニング
+- ⑧ memcachedキャッシュ活用
