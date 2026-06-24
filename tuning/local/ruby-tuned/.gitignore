@@ -1,0 +1,4 @@
+# 防御用: ここでbundleした場合のartifactを誤コミットしない(本来はコンテナ内でbundle)
+vendor/
+.bundle/
+*.gem

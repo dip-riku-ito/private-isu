@@ -826,3 +826,35 @@ EC2消失後のローカル固定スペック環境で、Ideationチーム(App/G
 
 ### 計測ツール（tuning/local/）
 `measure.sh`(per-run冷却+pmsetサーマル監視) / `measure_ab.sh`(interleaved A/B) / `profile.sh`(pprof採取) / `run.sh`(環境起動) / `nginx-variants/`(A/B用設定)。
+
+---
+
+## 🔴 Ruby 実装でのチューニング比較（2026-06-24）
+
+Go の施策を Ruby 参考実装へ移植し、素 vs tuned を同条件(固定スペック)で計測。
+
+### 結果
+| 構成 | スコア中央値 | 素→tuned | fail |
+|---|---|---|---|
+| Ruby 素 | 2,607 | — | 0 |
+| **Ruby tuned** | **372,619** | **×143** | 0 |
+| Go 素 | 9,450※ | — | 0 |
+| Go tuned | 537,376※ | ×~65 | 0 |
+※ Go素はsession開始時(cold)計測。マシンが~13%下方ドリフト後なので現在換算では Go素~8,200/Go tuned 537k。Ruby2構成は同一時点計測。
+
+### 言語間ギャップ（チューニングで縮小）
+- 素: Ruby は Go の **28%**(Goが約3.6倍速い)
+- tuned: Ruby は Go の **69%**(差は約1.4倍に縮小)
+- **示唆**: 高速化の大半は索引/JOIN+LIMIT/N+1解消/画像FS化＝**言語非依存のアルゴリズム/インフラ施策**。DBボトルネックを潰すと、ローカルはCPU律速でない(bench/レイテンシ律速)ため言語差が効きにくくなり、Ruby tuned が Go tuned に肉薄。Goのリード(~1.4倍)は純実行効率差。
+
+### Ruby に移植した施策 / 見送り
+- 移植: 索引(1/5)・my.cnf(7/8)・digest内製化=Digest::SHA512(2)・GET//posts のJOIN+LIMIT+FORCE INDEX(5/6)・make_postsのN+1バッチ解消・画像FS化(3/16)・nginx静的+gzip off(3/7/C4)・unicorn workers=3。
+- 見送り(安全側): proxy_cache(13/15)=Rubyセッションcookie名差異+CSRF懸念 / プロセス内userキャッシュ(17)=unicornマルチワーカーでban反映漏れ→fail懸念。入れれば更に伸びる余地。
+
+### ハマり所
+- 社内TLS傍受→ build時のみ bundle/git のTLS検証無効化で回避(mysql2ネイティブgemでホストビルド不可)。digestはopenssl CLI依存だったため素baselineイメージにopenssl同梱(tunedはDigest::SHA512で不要)。
+- **GET /posts に del_flg JOIN 入れ忘れ→ban投稿混入で20件未満→fail**(修正済)。GET/と同じJOIN+LIMITが必須。
+
+### 成果物(tuning/local/)
+`compose.ruby-baseline.yml` / `compose.ruby-tuned.yml` / `nginx-ruby.conf` / `run-ruby-tuned.sh` / `ruby-tuned/{app.rb,unicorn_config.rb}`。
+tuned版は webapp/ruby を汚さないよう `ruby-tuned/` に保存し、run-ruby-tuned.sh がビルド時のみoverlay→git復元する。

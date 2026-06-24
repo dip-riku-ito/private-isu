@@ -1,0 +1,87 @@
+# ローカル: Ruby チューニング版。Goと同じ固定スペックで比較。
+#   tuned app.rb(digest内製/JOIN+LIMIT/N+1バッチ/画像FS) + nginx-ruby.conf + my.cnf + 索引 + dumpimages。
+# 実行: tuning/local/run-ruby-tuned.sh
+name: isu-ruby-tuned
+
+services:
+  nginx:
+    image: nginx:1.30
+    depends_on:
+      app:
+        condition: service_started
+    volumes:
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/tuning/local/nginx-ruby.conf:/etc/nginx/conf.d/default.conf:ro
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/webapp/public:/public:ro
+    ports:
+      - "80:80"
+    cpuset: "0,1"
+    mem_limit: 500m
+    networks: [isu]
+
+  app:
+    build:
+      context: /Users/riku-ito/Workspaces/sandbox/private-isu/webapp/ruby
+      dockerfile_inline: |
+        FROM ruby:4.0-slim
+        RUN apt-get update -qq && apt-get install -y --no-install-recommends build-essential default-libmysqlclient-dev git ragel openssl && rm -rf /var/lib/apt/lists/*
+        WORKDIR /home/webapp
+        COPY Gemfile Gemfile.lock prepare_unicorn.rb ./
+        RUN git config --global http.sslVerify false \
+          && bundle config set --local path 'vendor/bundle' \
+          && bundle config set --local ssl_verify_mode 0 \
+          && bundle install \
+          && bundle exec ruby prepare_unicorn.rb
+        COPY . .
+        ENTRYPOINT ["bundle", "exec", "unicorn", "-c", "unicorn_config.rb"]
+    depends_on:
+      mysql:
+        condition: service_healthy
+      memcached:
+        condition: service_started
+    environment:
+      ISUCONP_DB_HOST: mysql
+      ISUCONP_DB_PORT: 3306
+      ISUCONP_DB_USER: root
+      ISUCONP_DB_PASSWORD: root
+      ISUCONP_DB_NAME: isuconp
+      ISUCONP_MEMCACHED_ADDRESS: memcached:11211
+    volumes:
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/webapp/public:/home/public
+    init: true
+    restart: unless-stopped
+    cpuset: "0,1"
+    mem_limit: 1000m
+    networks: [isu]
+
+  mysql:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_HOST: "%"
+      MYSQL_ROOT_PASSWORD: root
+    volumes:
+      - mysql-ruby-tuned:/var/lib/mysql
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/webapp/sql:/docker-entrypoint-initdb.d:ro
+      - /Users/riku-ito/Workspaces/sandbox/private-isu/tuning/my.cnf:/etc/mysql/conf.d/zz-tuning.cnf:ro
+    ports:
+      - "3306:3306"
+    cpuset: "0,1"
+    mem_limit: 1600m
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-proot"]
+      interval: 5s
+      timeout: 5s
+      retries: 60
+      start_period: 600s
+    networks: [isu]
+
+  memcached:
+    image: memcached:1.6
+    cpuset: "0,1"
+    mem_limit: 400m
+    networks: [isu]
+
+volumes:
+  mysql-ruby-tuned:
+
+networks:
+  isu:
